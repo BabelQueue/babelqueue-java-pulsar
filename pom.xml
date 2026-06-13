@@ -82,6 +82,13 @@
             <version>${mockito.version}</version>
             <scope>test</scope>
         </dependency>
+        <!-- Parses the vendored conformance manifest in PulsarConformanceTest. -->
+        <dependency>
+            <groupId>org.json</groupId>
+            <artifactId>json</artifactId>
+            <version>20240303</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
