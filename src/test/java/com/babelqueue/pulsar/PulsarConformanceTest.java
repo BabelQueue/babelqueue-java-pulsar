@@ -1,6 +1,7 @@
 package com.babelqueue.pulsar;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.mock;
@@ -10,6 +11,7 @@ import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
 import java.util.Map;
 import org.apache.pulsar.client.api.Consumer;
 import org.apache.pulsar.client.api.Message;
@@ -78,6 +80,42 @@ class PulsarConformanceTest {
                 .poll();
 
             assertEquals(testCase.getInt("expected_attempts"), seen[0], testCase.getString("name"));
+        }
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void schemaVersionGateMatchesGolden() throws Exception {
+        JSONObject gate = pulsarBlock().getJSONObject("schema_version_gate");
+        String property = gate.getString("property");
+        byte[] value = resource(gate.getString("fixture")).getBytes(StandardCharsets.UTF_8);
+        JSONArray cases = gate.getJSONArray("cases");
+        assertTrue(cases.length() > 0);
+
+        for (int i = 0; i < cases.length(); i++) {
+            JSONObject testCase = cases.getJSONObject(i);
+            boolean decode = "decode".equals(testCase.getString("expect"));
+            String label = testCase.has("value") ? "value=" + testCase.getString("value") : "absent";
+
+            Map<String, String> properties = new HashMap<>();
+            if (testCase.has("value")) {
+                properties.put(property, testCase.getString("value"));
+            }
+            Message<byte[]> msg = mock(Message.class);
+            when(msg.getValue()).thenReturn(value);
+            when(msg.getProperties()).thenReturn(properties);
+            when(msg.getProperty(property)).thenReturn(properties.get(property));
+
+            Consumer<byte[]> consumer = mock(Consumer.class);
+            when(consumer.receive(anyInt(), any())).thenReturn(msg);
+
+            int[] handled = {0};
+            PulsarConsumer.builder(consumer)
+                .handler(URN, (env, message) -> handled[0]++)
+                .build()
+                .poll();
+
+            assertEquals(decode ? 1 : 0, handled[0], label);
         }
     }
 }
