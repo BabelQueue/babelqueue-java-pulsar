@@ -49,6 +49,12 @@ Delayed delivery: `publish(urn, data, traceId, Duration.ofMinutes(5))` → nativ
 body's `job`: when both exist and differ, the property wins. Only a message with no `bq-job`
 property (produced outside BabelQueue) falls back to the body's `job`/`urn`.
 
+Before decoding the body, the consumer version-gates on the `bq-schema-version` property
+(§5.7 step 3): a value that is not exactly the schema version the core supports, compared exactly as sent with no
+trimming (`"2"`, `"x"`, `"01"`, `" 1"`, …) is rejected without decoding — `onError` is called with a `null` envelope and the
+message is `negativeAcknowledge`d, the same path as a non-conformant envelope. A missing or blank (empty or
+ASCII-whitespace-only: space, tab, LF, VT, FF, CR; NBSP, U+0085, U+FEFF etc. are not blank) property changes nothing; a `"1"` property still goes through the post-decode `accepts()` check.
+
 ## Contract mapping (§5)
 
 | Envelope | Apache Pulsar |

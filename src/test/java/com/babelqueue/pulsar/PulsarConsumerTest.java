@@ -2,6 +2,7 @@ package com.babelqueue.pulsar;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
@@ -19,6 +20,8 @@ import java.util.Map;
 import org.apache.pulsar.client.api.Consumer;
 import org.apache.pulsar.client.api.Message;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * Consumer behaviour against a mocked Pulsar consumer (no broker): routing on the
@@ -372,6 +375,103 @@ class PulsarConsumerTest {
         PulsarConsumer.builder(consumer).onError((e, env, msg) -> reported[0] = e).build().poll();
 
         assertInstanceOf(BabelQueueException.class, reported[0]);
+        verify(consumer).negativeAcknowledge(message);
+    }
+
+    @Test
+    void missingSchemaVersionPropertyDecodesAndDelivers() throws Exception {
+        Message<byte[]> message = message(0, envelopeJson(), Map.of("bq-job", URN));
+        Consumer<byte[]> consumer = consumerWith(message);
+        int[] delivered = { 0 };
+
+        PulsarConsumer.builder(consumer).handler(URN, (env, msg) -> delivered[0]++).build().poll();
+
+        assertEquals(1, delivered[0]);
+        verify(consumer).acknowledge(message);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "", "  ", "\t", "\u000B", "\f", "\n", "\r" })
+    void blankSchemaVersionPropertyDecodesAndDelivers(String blank) throws Exception {
+        // A blank property is treated like a missing one (same rule as Go/Python/Node): not gated.
+        Message<byte[]> message = message(0, envelopeJson(), Map.of("bq-job", URN, "bq-schema-version", blank));
+        Consumer<byte[]> consumer = consumerWith(message);
+        int[] delivered = { 0 };
+
+        PulsarConsumer.builder(consumer).handler(URN, (env, msg) -> delivered[0]++).build().poll();
+
+        assertEquals(1, delivered[0]);
+        verify(consumer).acknowledge(message);
+    }
+
+    @Test
+    void supportedSchemaVersionPropertyDelivers() throws Exception {
+        Message<byte[]> message = message(0, envelopeJson(),
+            Map.of("bq-schema-version", Integer.toString(EnvelopeCodec.SCHEMA_VERSION)));
+        Consumer<byte[]> consumer = consumerWith(message);
+        int[] delivered = { 0 };
+
+        PulsarConsumer.builder(consumer).handler(URN, (env, msg) -> delivered[0]++).build().poll();
+
+        assertEquals(1, delivered[0]);
+        verify(consumer).acknowledge(message);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = { "2", "x", "01", "1.0", "-1", " 1", "1 ", "\t1",
+        "\u00A0", "\u001C", "\u0085", "\uFEFF" })
+    void unknownSchemaVersionPropertyIsRejectedBeforeDecoding(String version) throws Exception {
+        // The body is invalid JSON: if it were decoded the failure would be the generic
+        // non-conformant-envelope rejection, not the version-gate message.
+        Message<byte[]> message = message(0, "{ this is not json", Map.of("bq-schema-version", version));
+        Consumer<byte[]> consumer = consumerWith(message);
+        Throwable[] reported = { null };
+        Envelope[] reportedEnvelope = { null };
+        int[] delivered = { 0 };
+
+        int count = PulsarConsumer.builder(consumer)
+            .handler(URN, (env, msg) -> delivered[0]++)
+            .onError((e, env, msg) -> {
+                reported[0] = e;
+                reportedEnvelope[0] = env;
+            })
+            .build()
+            .poll();
+
+        assertEquals(1, count);
+        assertEquals(0, delivered[0]);
+        assertInstanceOf(BabelQueueException.class, reported[0]);
+        assertTrue(reported[0].getMessage().contains("bq-schema-version"), reported[0].getMessage());
+        assertTrue(reported[0].getMessage().contains("'" + version + "'"), reported[0].getMessage());
+        assertNull(reportedEnvelope[0]);
+        verify(consumer).negativeAcknowledge(message);
+        verify(consumer, never()).acknowledge(any(Message.class));
+        verify(message, never()).getValue();
+    }
+
+    @Test
+    void unknownSchemaVersionWithValidBodyIsStillRejectedAndNeverRouted() throws Exception {
+        Message<byte[]> message = message(0, envelopeJson(), Map.of("bq-job", URN, "bq-schema-version", "2"));
+        Consumer<byte[]> consumer = consumerWith(message);
+        int[] delivered = { 0 };
+
+        PulsarConsumer.builder(consumer).handler(URN, (env, msg) -> delivered[0]++).build().poll();
+
+        assertEquals(0, delivered[0]);
+        verify(consumer).negativeAcknowledge(message);
+    }
+
+    @Test
+    void supportedSchemaVersionPropertyStillRunsPostDecodeAccepts() throws Exception {
+        // Property says "1" but the body is not a conformant envelope: accepts() still rejects it.
+        Message<byte[]> message = message(0, "{ this is not json", Map.of("bq-schema-version", "1"));
+        Consumer<byte[]> consumer = consumerWith(message);
+        Throwable[] reported = { null };
+
+        PulsarConsumer.builder(consumer).onError((e, env, msg) -> reported[0] = e).build().poll();
+
+        assertInstanceOf(BabelQueueException.class, reported[0]);
+        assertTrue(reported[0].getMessage().contains("non-conformant"), reported[0].getMessage());
         verify(consumer).negativeAcknowledge(message);
     }
 

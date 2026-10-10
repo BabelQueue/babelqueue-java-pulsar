@@ -27,13 +27,28 @@ import org.apache.pulsar.client.api.PulsarClientException;
  * {@code job} differ, the property still routes and the optional {@code onRoutingMismatch} hook
  * is notified (a throwing hook is swallowed; the message is settled normally). The loop never stops on a bad
  * message — observe via {@code onError}/{@code onUnknownUrn}.
+ *
+ * <p>Per §5.7 step 3 the {@code bq-schema-version} property is checked <b>before</b> the body is
+ * decoded: when it is present and is not exactly the schema version the core supports
+ * ({@link EnvelopeCodec#SCHEMA_VERSION}, compared exactly as sent, as its canonical decimal string, with no
+ * trimming — so {@code "2"}, {@code "x"}, {@code "01"} and {@code " 1"} are all unknown), the body is never decoded or routed; {@code onError}
+ * is notified (with a {@code null} envelope) and the message is {@code negativeAcknowledge}d, the same
+ * settle path as a non-conformant envelope. A missing or blank (empty or ASCII-whitespace-only: space, tab, LF, VT, FF, CR) property changes nothing, and a
+ * {@code "1"} property still goes through the post-decode {@link EnvelopeCodec#accepts} check.
  */
 public final class PulsarConsumer {
 
     private static final String JOB_PROPERTY = "bq-job";
     private static final String ATTEMPTS_PROPERTY = "bq-attempts";
+    private static final String SCHEMA_VERSION_PROPERTY = "bq-schema-version";
 
-    /** Notified of a non-conformant envelope, an unmapped URN (no {@code onUnknownUrn}), or a throwing handler. */
+    /**
+     * Notified of a non-conformant envelope, an unmapped URN (no {@code onUnknownUrn}), a throwing
+     * handler, a transient receive error, or a message rejected by the §5.7 step 3 schema-version
+     * gate. {@code envelope} is {@code null} when the body was not decoded (a version-gated message
+     * or a receive error) — guard against it before dereferencing. {@code message} is {@code null}
+     * for a receive error.
+     */
     @FunctionalInterface
     public interface ErrorHandler {
         void onError(Throwable error, Envelope envelope, Message<byte[]> message);
@@ -99,6 +114,19 @@ public final class PulsarConsumer {
 
     private void handle(Message<byte[]> message) throws PulsarClientException {
         Map<String, String> properties = message.getProperties();
+
+        // §5.7 step 3: version-gate on the property before decoding the body.
+        // The value is compared exactly as sent (no trimming), like the Go/Python/Node consumers (GR-5).
+        String declaredVersion = rawProperty(properties, SCHEMA_VERSION_PROPERTY);
+        if (declaredVersion != null && !isBlankSchemaVersion(declaredVersion)
+            && !declaredVersion.equals(Integer.toString(EnvelopeCodec.SCHEMA_VERSION))) {
+            report(new BabelQueueException("Rejected a Pulsar message: unsupported "
+                + SCHEMA_VERSION_PROPERTY + " property '" + declaredVersion + "' (supported: "
+                + EnvelopeCodec.SCHEMA_VERSION + "); body not decoded."), null, message);
+            consumer.negativeAcknowledge(message);
+            return;
+        }
+
         Envelope envelope = reconcile(
             EnvelopeCodec.decode(new String(message.getValue(), StandardCharsets.UTF_8)),
             rawProperty(properties, ATTEMPTS_PROPERTY),
@@ -168,6 +196,21 @@ public final class PulsarConsumer {
     /** The property value exactly as sent (no trimming), or {@code null} when the map or the value is missing. */
     private static String rawProperty(Map<String, String> properties, String key) {
         return properties == null ? null : properties.get(key);
+    }
+
+    /**
+     * The shared cross-SDK "blank" definition for {@code bq-schema-version}: the empty string, or a value made up
+     * <b>only</b> of ASCII whitespace ({@code ' '}, {@code \t}, {@code \n}, U+000B, {@code \f}, {@code \r}). Anything else
+     * (NBSP, U+001C–U+001F, U+0085, U+FEFF, …) is <b>not</b> blank, unlike {@link String#isBlank()}.
+     */
+    private static boolean isBlankSchemaVersion(String value) {
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c != ' ' && (c < '\t' || c > '\r')) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** {@code ^[0-9]+$}: ASCII digits only — no sign, no whitespace, not empty, no Unicode digits. */
