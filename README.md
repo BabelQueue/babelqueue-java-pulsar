@@ -15,7 +15,7 @@ the .NET, Python, Go and Node SDKs. Implements
 <dependency>
   <groupId>com.babelqueue</groupId>
   <artifactId>babelqueue-pulsar</artifactId>
-  <version>1.0.0</version>
+  <version>1.1.0</version>
 </dependency>
 ```
 
