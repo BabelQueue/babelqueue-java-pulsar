@@ -21,8 +21,9 @@ import org.apache.pulsar.client.api.Message;
 import org.junit.jupiter.api.Test;
 
 /**
- * Consumer behaviour against a mocked Pulsar consumer (no broker): attempts =
- * max(body, getRedeliveryCount()), acknowledge on success, negativeAcknowledge on
+ * Consumer behaviour against a mocked Pulsar consumer (no broker): routing on the
+ * {@code bq-job} property (body fallback), attempts from {@code bq-attempts} reconciled with
+ * getRedeliveryCount(), acknowledge on success, negativeAcknowledge on
  * failure / non-conformant / unmapped URN, and the unknown-URN hooks.
  */
 class PulsarConsumerTest {
@@ -45,6 +46,12 @@ class PulsarConsumerTest {
         Message<byte[]> msg = mock(Message.class);
         when(msg.getValue()).thenReturn(body.getBytes(StandardCharsets.UTF_8));
         when(msg.getRedeliveryCount()).thenReturn(redeliveryCount);
+        return msg;
+    }
+
+    private static Message<byte[]> message(int redeliveryCount, String body, Map<String, String> properties) {
+        Message<byte[]> msg = message(redeliveryCount, body);
+        when(msg.getProperties()).thenReturn(properties);
         return msg;
     }
 
@@ -92,6 +99,221 @@ class PulsarConsumerTest {
             .build()
             .poll();
         assertEquals(5, seen[0]);
+    }
+
+    @Test
+    void bqJobPropertyWinsOverBodyUrn() throws Exception {
+        // Body says orders:created, the bq-job property says orders:refunded: the property routes.
+        String other = "urn:babel:orders:refunded";
+        Message<byte[]> message = message(0, envelopeJson(), Map.of("bq-job", other));
+        Consumer<byte[]> consumer = consumerWith(message);
+        String[] routedTo = { null };
+
+        PulsarConsumer.builder(consumer)
+            .handler(URN, (env, msg) -> routedTo[0] = "body")
+            .handler(other, (env, msg) -> routedTo[0] = "property")
+            .build()
+            .poll();
+
+        assertEquals("property", routedTo[0]);
+        verify(consumer).acknowledge(message);
+    }
+
+    @Test
+    void bqJobPropertyWithoutHandlerIsUnknownEvenIfBodyUrnHasOne() throws Exception {
+        Message<byte[]> message = message(0, envelopeJson(), Map.of("bq-job", "urn:babel:orders:refunded"));
+        Consumer<byte[]> consumer = consumerWith(message);
+        Throwable[] reported = { null };
+
+        PulsarConsumer.builder(consumer)
+            .handler(URN, (env, msg) -> { throw new AssertionError("must not route on the body"); })
+            .onError((e, env, msg) -> reported[0] = e)
+            .build()
+            .poll();
+
+        UnknownUrnException unknown = assertInstanceOf(UnknownUrnException.class, reported[0]);
+        assertTrue(unknown.getMessage().contains("urn:babel:orders:refunded"));
+        verify(consumer).negativeAcknowledge(message);
+    }
+
+    @Test
+    void missingBqJobFallsBackToBodyUrn() throws Exception {
+        Message<byte[]> message = message(0, envelopeJson(), Map.of("bq-trace-id", "t"));
+        Consumer<byte[]> consumer = consumerWith(message);
+        boolean[] called = { false };
+
+        PulsarConsumer.builder(consumer).handler(URN, (env, msg) -> called[0] = true).build().poll();
+
+        assertTrue(called[0]);
+        verify(consumer).acknowledge(message);
+    }
+
+    @Test
+    void blankBqJobFallsBackToBodyUrn() throws Exception {
+        Message<byte[]> message = message(0, envelopeJson(), Map.of("bq-job", "  "));
+        boolean[] called = { false };
+
+        PulsarConsumer.builder(consumerWith(message)).handler(URN, (env, msg) -> called[0] = true).build().poll();
+
+        assertTrue(called[0]);
+    }
+
+    @Test
+    void bqAttemptsPropertyIsAuthoritativeOverBody() throws Exception {
+        // Body carries 0, the property says 3, the broker redelivered once: property wins over body.
+        Message<byte[]> message = message(1, envelopeJson(), Map.of("bq-attempts", "3"));
+        int[] seen = { -1 };
+
+        PulsarConsumer.builder(consumerWith(message))
+            .handler(URN, (env, msg) -> seen[0] = env.attempts())
+            .build()
+            .poll();
+
+        assertEquals(3, seen[0]);
+    }
+
+    @Test
+    void bqAttemptsPropertyLowerThanBodyStillWins() throws Exception {
+        Message<byte[]> message = message(0, envelopeJsonWithAttempts(5), Map.of("bq-attempts", "2"));
+        int[] seen = { -1 };
+
+        PulsarConsumer.builder(consumerWith(message))
+            .handler(URN, (env, msg) -> seen[0] = env.attempts())
+            .build()
+            .poll();
+
+        assertEquals(2, seen[0]);
+    }
+
+    @Test
+    void redeliveryCountRaisesAHigherNativeCountOverBqAttempts() throws Exception {
+        // A native negative-ack redelivery does not touch bq-attempts; the higher native count is kept.
+        Message<byte[]> message = message(4, envelopeJson(), Map.of("bq-attempts", "1"));
+        int[] seen = { -1 };
+
+        PulsarConsumer.builder(consumerWith(message))
+            .handler(URN, (env, msg) -> seen[0] = env.attempts())
+            .build()
+            .poll();
+
+        assertEquals(4, seen[0]);
+    }
+
+    @Test
+    void invalidBqAttemptsFallsBackToBodyAttempts() throws Exception {
+        for (String bad : new String[] { "abc", "-1", "", "+3", " 3", "3 ", "3\n", "\u0663", "99999999999" }) {
+            Message<byte[]> message = message(0, envelopeJsonWithAttempts(5), Map.of("bq-attempts", bad));
+            int[] seen = { -1 };
+
+            PulsarConsumer.builder(consumerWith(message))
+                .handler(URN, (env, msg) -> seen[0] = env.attempts())
+                .build()
+                .poll();
+
+            assertEquals(5, seen[0], "bq-attempts=" + bad);
+        }
+    }
+
+    @Test
+    void nonCanonicalBqAttemptsIsInvalidAndFallsBackToBody() throws Exception {
+        // "+3" must not parse as 3 (parity with .NET); the body's 5 is kept.
+        Message<byte[]> message = message(0, envelopeJsonWithAttempts(5), Map.of("bq-attempts", "+3"));
+        int[] seen = { -1 };
+
+        PulsarConsumer.builder(consumerWith(message))
+            .handler(URN, (env, msg) -> seen[0] = env.attempts())
+            .build()
+            .poll();
+
+        assertEquals(5, seen[0]);
+    }
+
+    @Test
+    void bqJobBodyJobMismatchCallsRoutingMismatchHookNotOnError() throws Exception {
+        String other = "urn:babel:orders:refunded";
+        Message<byte[]> message = message(0, envelopeJson(), Map.of("bq-job", other));
+        Consumer<byte[]> consumer = consumerWith(message);
+        java.util.List<String> mismatches = new java.util.ArrayList<>();
+        java.util.List<Throwable> errors = new java.util.ArrayList<>();
+        boolean[] called = { false };
+
+        PulsarConsumer.builder(consumer)
+            .handler(other, (env, msg) -> called[0] = true)
+            .onError((e, env, msg) -> errors.add(e))
+            .onRoutingMismatch((property, body, env, msg) -> mismatches.add(property + "|" + body))
+            .build()
+            .poll();
+
+        assertTrue(called[0]);
+        verify(consumer).acknowledge(message);
+        assertEquals(java.util.List.of(other + "|" + URN), mismatches);
+        assertTrue(errors.isEmpty());
+    }
+
+    @Test
+    void throwingRoutingMismatchHookIsSwallowedAndMessageIsAcknowledged() throws Exception {
+        String other = "urn:babel:orders:refunded";
+        Message<byte[]> message = message(0, envelopeJson(), Map.of("bq-job", other));
+        Consumer<byte[]> consumer = consumerWith(message);
+        boolean[] called = { false };
+        java.util.List<Throwable> errors = new java.util.ArrayList<>();
+
+        int count = PulsarConsumer.builder(consumer)
+            .handler(other, (env, msg) -> called[0] = true)
+            .onError((e, env, msg) -> errors.add(e))
+            .onRoutingMismatch((property, body, env, msg) -> { throw new IllegalStateException("hook boom"); })
+            .build()
+            .poll();
+
+        assertEquals(1, count);
+        assertTrue(called[0]);
+        verify(consumer).acknowledge(message);
+        verify(consumer, never()).negativeAcknowledge(any(Message.class));
+        assertTrue(errors.isEmpty());
+    }
+
+    @Test
+    void mismatchWithoutHookIsSilent() throws Exception {
+        Message<byte[]> message = message(0, envelopeJson(), Map.of("bq-job", "urn:babel:orders:refunded"));
+        Consumer<byte[]> consumer = consumerWith(message);
+
+        PulsarConsumer.builder(consumer).handler("urn:babel:orders:refunded", (env, msg) -> { }).build().poll();
+
+        verify(consumer).acknowledge(message);
+    }
+
+    @Test
+    void matchingBqJobDoesNotCallRoutingMismatchHook() throws Exception {
+        Message<byte[]> message = message(0, envelopeJson(), Map.of("bq-job", URN));
+        java.util.List<Throwable> reported = new java.util.ArrayList<>();
+
+        PulsarConsumer.builder(consumerWith(message))
+            .handler(URN, (env, msg) -> { })
+            .onRoutingMismatch((property, body, env, msg) -> reported.add(new IllegalStateException(property)))
+            .build()
+            .poll();
+
+        assertTrue(reported.isEmpty());
+    }
+
+    @Test
+    void bodyWithoutJobIsRejectedEvenWhenBqJobIsPresent() throws Exception {
+        String badBody = "{\"trace_id\":\"t\",\"data\":{\"x\":1},"
+            + "\"meta\":{\"id\":\"m\",\"queue\":\"q\",\"lang\":\"java\",\"schema_version\":1,\"created_at\":1},"
+            + "\"attempts\":0}";
+        Message<byte[]> message = message(0, badBody, Map.of("bq-job", URN));
+        Consumer<byte[]> consumer = consumerWith(message);
+        Throwable[] reported = { null };
+
+        PulsarConsumer.builder(consumer)
+            .handler(URN, (env, msg) -> { throw new AssertionError("must not reach the handler"); })
+            .onError((e, env, msg) -> reported[0] = e)
+            .build()
+            .poll();
+
+        assertInstanceOf(BabelQueueException.class, reported[0]);
+        verify(consumer).negativeAcknowledge(message);
+        verify(consumer, never()).acknowledge(any(Message.class));
     }
 
     @Test

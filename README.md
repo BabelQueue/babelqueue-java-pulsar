@@ -45,8 +45,9 @@ consumer.run(); // poll until the thread is interrupted
 ```
 
 Delayed delivery: `publish(urn, data, traceId, Duration.ofMinutes(5))` → native
-`deliverAfter`. The consumer routes purely on the `bq-job` property, so it never decodes a
-message it cannot handle.
+`deliverAfter`. The consumer routes on the `bq-job` property (§5.2/§5.7), not on the
+body's `job`: when both exist and differ, the property wins. Only a message with no `bq-job`
+property (produced outside BabelQueue) falls back to the body's `job`/`urn`.
 
 ## Contract mapping (§5)
 
@@ -63,14 +64,15 @@ message it cannot handle.
 | reserve / ack / retry | `acknowledge` / `negativeAcknowledge` |
 
 Pulsar properties are string→string, so `bq-attempts` carries the contract `attempts` and is
-**authoritative**. The consumer reconciles to `max(bq-attempts, getRedeliveryCount())`:
+**authoritative**. The consumer reads `bq-attempts` (falling back to the body's `attempts` when the property is
+absent or does not match `^[0-9]+$` — ASCII digits only, no sign/whitespace, within `int`) and reconciles to `max(bq-attempts, getRedeliveryCount())`:
 `getRedeliveryCount()` is 0-based (0 on first delivery) so it maps directly to `attempts`
-with **no −1**, and the `max` never lowers a higher body count — so a republish-driven retry
+with **no −1**, and the `max` never lowers the carried-over count — so a republish-driven retry
 (Go/Python transports increment `bq-attempts` and re-send) and a native negative-ack redelivery
 both converge on the same number. A throwing handler `negativeAcknowledge`s the message, so
 the broker redelivers it (at-least-once); with a native `DeadLetterPolicy` it eventually moves
 to the cross-language `<queue>.dlq` topic. The poll loop never stops on a bad message — observe
-via `onError`/`onUnknownUrn`. The envelope is unchanged (`schema_version` stays `1`); Pulsar is
+via `onError`/`onUnknownUrn`. If `bq-job` differs from the body's `job`, the property still routes and the optional `onRoutingMismatch` hook is called with the property URN, body URN and envelope/message (a throwing hook is swallowed; settling is unaffected; `onError` is not involved). The envelope is unchanged (`schema_version` stays `1`); Pulsar is
 purely additive.
 
 ## Build & test
