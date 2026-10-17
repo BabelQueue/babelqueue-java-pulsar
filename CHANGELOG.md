@@ -18,6 +18,7 @@ The envelope wire format is versioned separately by `meta.schema_version`
 ### Changed
 
 - The `babelqueue-core` dependency is raised from 1.0.0 to 1.8.0, the first core release whose `Envelope` carries extras and exposes `withAttempts`.
+- Known limitation: this release resolves `babelqueue-core` 1.8.0 transitively, which predates the ADR-0031 decode behaviour (`job` + `urn` warning, closed ASCII blank set, encode-time extension-key rejection). Add `babelqueue-core` >= 1.11.0 as a direct dependency to get it; the pin will be raised in the next PATCH release.
 
 ## [1.1.0] - 2026-10-10
 

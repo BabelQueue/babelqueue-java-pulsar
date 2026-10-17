@@ -19,6 +19,11 @@ the .NET, Python, Go and Node SDKs. Implements
 </dependency>
 ```
 
+> **ADR-0031 behaviour needs core 1.11.0.** This release resolves `babelqueue-core` 1.8.0 transitively, which
+> predates the ADR-0031 decode behaviour (the `job` + `urn` warning, the closed ASCII blank set, encode-time
+> rejection of invalid extension keys). To get it, add `babelqueue-core` >= 1.11.0 as a direct dependency; the
+> pin will be raised in the next PATCH release.
+
 It pulls `babelqueue-core` and `org.apache.pulsar:pulsar-client` transitively.
 
 ## Use

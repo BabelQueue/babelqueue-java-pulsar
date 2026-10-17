@@ -104,12 +104,15 @@ class PulsarConsumerTest {
     }
 
     /**
-     * Pulsar redelivers and dead-letters natively (the broker keeps the original body), so the adapter's
-     * DLQ-adjacent path is the envelope handed to {@code onError} on a failing handler: a dead_letter block built
-     * from it must still carry the extras.
+     * Core-level lock, not an adapter DLQ test: Pulsar dead-letters natively and the broker keeps the original
+     * body, so this adapter has no path that rewrites the body into a DLQ (it only negative-acknowledges and
+     * leaves dead-lettering to the broker). What the adapter does own is the envelope it hands to
+     * {@code onError}: that must still carry the unknown keys (first two assertions), and the core
+     * {@link DeadLetters#annotate} an application builds on it must keep them (remaining assertions, which
+     * exercise the core, not this adapter).
      */
     @Test
-    void failingHandlerEnvelopeKeepsUnknownKeysThroughDeadLetterAnnotation() throws Exception {
+    void onErrorEnvelopeKeepsUnknownKeysAndCoreDeadLetterAnnotationRetainsThem() throws Exception {
         Message<byte[]> message = message(2, jsonWithExtras());
         Envelope[] failed = { null };
         PulsarConsumer.builder(consumerWith(message))
@@ -117,6 +120,9 @@ class PulsarConsumerTest {
             .onError((e, env, msg) -> failed[0] = env)
             .build()
             .poll();
+
+        assertEquals(1L, failed[0].extras().get("extra_top"), "adapter: onError envelope keeps top-level extras");
+        assertEquals(true, failed[0].meta().extras().get("vendor_flag"), "adapter: onError envelope keeps meta extras");
 
         Envelope dead = EnvelopeCodec.decode(EnvelopeCodec.encode(
             DeadLetters.annotate(failed[0], "failed", "orders", failed[0].attempts(), "boom",
