@@ -247,9 +247,7 @@ public final class PulsarConsumer {
         if (attempts == envelope.attempts()) {
             return envelope;
         }
-        return new Envelope(
-            envelope.job(), envelope.traceId(), envelope.data(), envelope.meta(),
-            attempts, envelope.deadLetter());
+        return envelope.withAttempts(attempts);
     }
 
     private void report(Throwable error, Envelope envelope, Message<byte[]> message) {

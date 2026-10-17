@@ -12,6 +12,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.babelqueue.BabelQueueException;
+import com.babelqueue.DeadLetters;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
 import com.babelqueue.UnknownUrnException;
@@ -79,6 +80,51 @@ class PulsarConsumerTest {
         assertEquals(1, count);
         assertEquals(2, seen[0]);
         verify(consumer).acknowledge(message);
+    }
+
+    /** Body carrying a top-level {@code extra_top} and {@code meta.vendor_flag} (ADR-0031). */
+    private static String jsonWithExtras() {
+        return "{\"job\":\"" + URN + "\",\"trace_id\":\"trace-1\",\"data\":{\"order_id\":7},"
+            + "\"meta\":{\"id\":\"m-1\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,"
+            + "\"created_at\":1700000000000,\"vendor_flag\":true},\"attempts\":0,\"extra_top\":1}";
+    }
+
+    @Test
+    void attemptsReconcilePreservesUnknownTopLevelAndMetaKeys() throws Exception {
+        Message<byte[]> message = message(2, jsonWithExtras()); // attempts 0 -> 2
+        Envelope[] seen = { null };
+        PulsarConsumer.builder(consumerWith(message))
+            .handler(URN, (env, msg) -> seen[0] = env)
+            .build()
+            .poll();
+
+        assertEquals(2, seen[0].attempts());
+        assertEquals(1L, seen[0].extras().get("extra_top"));
+        assertEquals(true, seen[0].meta().extras().get("vendor_flag"));
+    }
+
+    /**
+     * Pulsar redelivers and dead-letters natively (the broker keeps the original body), so the adapter's
+     * DLQ-adjacent path is the envelope handed to {@code onError} on a failing handler: a dead_letter block built
+     * from it must still carry the extras.
+     */
+    @Test
+    void failingHandlerEnvelopeKeepsUnknownKeysThroughDeadLetterAnnotation() throws Exception {
+        Message<byte[]> message = message(2, jsonWithExtras());
+        Envelope[] failed = { null };
+        PulsarConsumer.builder(consumerWith(message))
+            .handler(URN, (env, msg) -> { throw new IllegalStateException("boom"); })
+            .onError((e, env, msg) -> failed[0] = env)
+            .build()
+            .poll();
+
+        Envelope dead = EnvelopeCodec.decode(EnvelopeCodec.encode(
+            DeadLetters.annotate(failed[0], "failed", "orders", failed[0].attempts(), "boom",
+                IllegalStateException.class.getName())));
+        assertEquals(1L, dead.extras().get("extra_top"));
+        assertEquals(true, dead.meta().extras().get("vendor_flag"));
+        assertEquals("failed", dead.deadLetter().reason());
+        assertEquals("orders", dead.deadLetter().originalQueue());
     }
 
     @Test

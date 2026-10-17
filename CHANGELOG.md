@@ -9,6 +9,16 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-10-17
+
+### Fixed
+
+- Unknown top-level keys and unknown `meta` keys (ADR-0031 extension keys, e.g. `extra_top`, `meta.vendor_flag`) are no longer dropped when `PulsarConsumer` reconciles `attempts` from `bq-attempts` / the redelivery count: the envelope handed to handlers, `onUnknownUrn` and `onError` is rebuilt with `Envelope.withAttempts`, which carries the extras, instead of the 6-argument constructor. Regression tests cover the handler envelope and a dead-letter annotation built from the `onError` envelope (Pulsar dead-letters natively, so the broker keeps the original body).
+
+### Changed
+
+- The `babelqueue-core` dependency is raised from 1.0.0 to 1.8.0, the first core release whose `Envelope` carries extras and exposes `withAttempts`.
+
 ## [1.1.0] - 2026-10-10
 
 ### Added
