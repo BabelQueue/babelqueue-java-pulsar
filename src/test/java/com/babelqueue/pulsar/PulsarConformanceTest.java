@@ -25,10 +25,11 @@ import org.json.JSONObject;
 import org.junit.jupiter.api.Test;
 
 /**
- * Apache Pulsar binding conformance against the vendored canonical suite's {@code pulsar} and
- * {@code pulsar_exhaustion} sections: the §5 property projection (bq-* string→string), the
+ * Apache Pulsar binding conformance against the vendored canonical suite's {@code pulsar},
+ * {@code pulsar_exhaustion} and {@code version_gate_pulsar} sections: the §5 property projection (bq-* string→string), the
  * {@code attempts = max(body, RedeliveryCount)} reconciliation (no −1; the redelivery count is 0-based), the
- * §5.7 step 3 schema-version gate, and the ADR-0036 settle decision (retry / dlq / drop). The Pulsar
+ * §5.7 step 3 schema-version gate, the ADR-0036 settle decision (retry / dlq / drop) and the ADR-0037 version-gate
+ * settle rule ({@code version_gate_pulsar}: ack / raw DLQ record / unsettled). The Pulsar
  * consumer/message are mocked with Mockito — no Pulsar, no network. Each case is recorded for the
  * {@code results.json} ({@link PulsarConformanceResults}).
  */
@@ -154,7 +155,7 @@ class PulsarConformanceTest {
                 // This consumer has no unknown-URN strategy option (a unmapped URN goes to onUnknownUrn or takes the
                 // bounded max-attempts path): the suite tells Java, .NET and Node runners to skip these rows.
                 PulsarConformanceResults.skip("pulsar_exhaustion", name,
-                    "the Java Pulsar consumer has no on_unknown_urn strategy option");
+                    "ADR-0036: the Java Pulsar consumer has no on_unknown_urn strategy option");
                 skipped++;
                 continue;
             }
@@ -253,6 +254,95 @@ class PulsarConformanceTest {
                 assertEquals(0, retries.sends(), label);
             }
             default -> assertFalse(true, "unknown outcome in " + label);
+        }
+    }
+    // ---- version_gate_pulsar (ADR-0037 decision 1) -----------------------------------------------------------------
+
+    @Test
+    void versionGateSettleRuleMatchesGolden() throws Throwable {
+        JSONObject section = manifest().getJSONObject("version_gate_pulsar");
+        JSONArray cases = section.getJSONArray("cases");
+        JSONArray bodies = section.getJSONArray("incoming_bodies");
+        assertTrue(cases.length() > 0);
+        assertTrue(bodies.length() > 0);
+        int asserted = 0;
+        for (int i = 0; i < cases.length(); i++) {
+            JSONObject testCase = cases.getJSONObject(i);
+            String name = testCase.getString("name");
+            String strategy = testCase.optString("on_unknown_urn", "fail");
+            if (!"fail".equals(strategy)) {
+                // The Java Pulsar consumer has no unknown-URN strategy option (it behaves as `fail`): the suite
+                // tells Java, .NET and Node runners to skip these rows, never to pass them.
+                PulsarConformanceResults.skip("version_gate_pulsar", name,
+                    "ADR-0037: the Java Pulsar consumer has no on_unknown_urn strategy option");
+                continue;
+            }
+            PulsarConformanceResults.record("version_gate_pulsar", name, () -> {
+                for (int b = 0; b < bodies.length(); b++) {
+                    runVersionGateCase(testCase, bodies.getJSONObject(b).getString("body"));
+                }
+            }).execute();
+            asserted++;
+        }
+        assertTrue(asserted > 0, "the strategy-free rows must run");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void runVersionGateCase(JSONObject testCase, String bodyText) throws Exception {
+        String label = testCase.getString("name");
+        boolean deadLetter = "on".equals(testCase.getString("dead_letter"));
+        JSONObject expect = testCase.getJSONObject("expect");
+        byte[] body = bodyText.getBytes(StandardCharsets.UTF_8);
+
+        Map<String, String> properties = new HashMap<>();
+        properties.put("bq-schema-version", "2");
+        if (testCase.has("bq_attempts")) {
+            properties.put("bq-attempts", testCase.getString("bq_attempts"));
+        }
+        Message<byte[]> msg = mock(Message.class);
+        when(msg.getValue()).thenReturn(body);
+        when(msg.getProperties()).thenReturn(properties);
+        when(msg.getRedeliveryCount()).thenReturn(5);
+        when(msg.getTopicName()).thenReturn("persistent://public/default/orders");
+
+        Consumer<byte[]> consumer = mock(Consumer.class);
+        when(consumer.receive(anyInt(), any())).thenReturn(msg);
+
+        DeadLetterProbe dlq = new DeadLetterProbe();
+        if ("fails".equals(testCase.optString("dlq_write", "ok"))) {
+            dlq.failWith(new org.apache.pulsar.client.api.PulsarClientException("dlq write failed"));
+        }
+        int[] handled = {0};
+        PulsarConsumer.Builder builder = PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared)
+            .handler(URN, (env, message) -> handled[0]++);
+        if (deadLetter) {
+            builder.deadLetterProducer(dlq.producer);
+        }
+        builder.build().poll();
+
+        // Never decoded, never handled, never retried: the delivery is settled once, on its first delivery.
+        assertEquals(0, handled[0], label);
+        String outcome = !deadLetter && expect.has("outcome_no_writer")
+            ? expect.getString("outcome_no_writer") : expect.getString("outcome");
+        switch (outcome) {
+            case "dlq_raw" -> {
+                assertEquals(1, dlq.sends(), label);
+                assertEquals(bodyText, dlq.lastRecord(), label);
+                assertFalse(dlq.lastRecord().contains("\"dead_letter\""), label);
+                verify(consumer, times(1)).acknowledge(msg);
+                verify(consumer, never()).negativeAcknowledge(any(Message.class));
+            }
+            case "ack" -> {
+                assertEquals(0, dlq.sends(), label);
+                verify(consumer, times(1)).acknowledge(msg);
+                verify(consumer, never()).negativeAcknowledge(any(Message.class));
+            }
+            case "unsettled" -> {
+                assertEquals(0, dlq.sends(), label);
+                verify(consumer, times(1)).negativeAcknowledge(msg);
+                verify(consumer, never()).acknowledge(any(Message.class));
+            }
+            default -> assertFalse(true, "unknown outcome in " + label + ": " + outcome);
         }
     }
 }

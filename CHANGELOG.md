@@ -9,6 +9,23 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+MINOR (ADR-0037 decision 1). The envelope stays at `schema_version: 1`.
+
+### Changed (behaviour change)
+
+- **A version-gated message is no longer redelivered without limit.** A delivery whose `bq-schema-version`
+  property is present, not blank and not exactly `1` used to be negatively acknowledged forever. It is now
+  settled on its **first** delivery (never decoded, no handler or `onUnknownUrn` hook, no retry, whatever
+  `bq-attempts`, the redelivery count or `maxAttempts` say): with a `deadLetterProducer` the body is sent to
+  `<queue>.dlq` **exactly as received** (byte for byte, no `dead_letter` block, no re-encoding) and then
+  acknowledged; a failed write negative-acknowledges it, so the write is retried on redelivery. **Without a
+  dead-letter producer the message is acknowledged and dropped** (logged at `WARNING`). `onError` is still
+  notified, with a `null` envelope. This consumer has no unknown-URN strategy option, so the configured strategy
+  is `fail`.
+- Vendored the cross-SDK conformance suite v1.8.0 (`version_gate_pulsar` runner added; its non-`fail` strategy
+  rows are skipped, citing ADR-0037, because this consumer has no such option) and moved the CI pin and the
+  `results.json` check to it.
+
 ## [1.2.0] - 2026-10-25
 
 Implements ADR-0036 decisions 1 and 2 (post-R1 parity). The envelope stays at `schema_version: 1`.

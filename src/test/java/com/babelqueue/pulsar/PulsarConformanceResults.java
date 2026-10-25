@@ -26,12 +26,12 @@ import org.opentest4j.TestAbortedException;
  * when the test JVM exits. With the variable unset nothing is written.
  *
  * <p>This package carries the {@code pulsar} binding only, so exactly the manifest sections whose scope is
- * {@code pulsar} are in scope ({@code pulsar}, {@code pulsar_exhaustion}); the {@code core} sections are run and
+ * {@code pulsar} are in scope ({@code pulsar}, {@code pulsar_exhaustion}, {@code version_gate_pulsar}); the {@code core} sections are run and
  * reported by {@code babelqueue-core}. Every case id the manifest defines for an in-scope section ends up in the
  * file: a case that was never executed is written as {@code fail}, so a runner that forgets a case cannot go
- * green. The only {@code skip}s are the {@code pulsar_exhaustion} rows with an {@code on_unknown_urn} strategy,
- * which this consumer does not have (ADR-0036 decision 1; the suite tells Java, .NET and Node runners to skip
- * them).
+ * green. The only {@code skip}s are the {@code pulsar_exhaustion} (ADR-0036 decision 1) and
+ * {@code version_gate_pulsar} (ADR-0037 decision 1) rows with an {@code on_unknown_urn} strategy other than
+ * {@code fail}, which this consumer does not have (the suite tells Java, .NET and Node runners to skip them).
  */
 final class PulsarConformanceResults {
 
@@ -49,7 +49,7 @@ final class PulsarConformanceResults {
     }
 
     /**
-     * Wraps {@code body}: a normal return is {@code pass}, a JUnit abort is {@code skip} (reason prefixed with
+     * Wraps {@code body}: a normal return is {@code pass}, a JUnit abort is {@code skip} (reason carries
      * the authorising ADR), anything else is {@code fail} and is rethrown.
      */
     static Executable record(String section, String id, Executable body) {
@@ -68,10 +68,10 @@ final class PulsarConformanceResults {
         };
     }
 
-    /** Records {@code section}/{@code id} as skipped without running anything. */
+    /** Records {@code section}/{@code id} as skipped without running anything; {@code reason} cites its ADR. */
     static void skip(String section, String id, String reason) {
         install();
-        put(section, id, "skip", "ADR-0036: " + reason);
+        put(section, id, "skip", reason);
     }
 
     private static void put(String section, String id, String status, String reason) {
