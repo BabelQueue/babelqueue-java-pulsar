@@ -11,6 +11,8 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      BQ_CONFORMANCE_VERSION: 1.7.0
     strategy:
       fail-fast: false
       matrix:
@@ -29,12 +31,27 @@ jobs:
       # no network.
       - name: Test
         run: mvn -B --no-transfer-progress verify
+        env:
+          # The conformance runner writes results.json (ADR-0032) when this is set.
+          BQ_CONFORMANCE_RESULTS: ${{ runner.temp }}/results.json
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      # Schema-valid, no `fail`, the only `skip`s are the pulsar_exhaustion on_unknown_urn rows
+      # (ADR-0036), and every pulsar-scope section and case is present.
+      - name: Validate results.json
+        run: |
+          python -m pip install --quiet jsonschema==4.23.0
+          python -I .github/scripts/check-conformance-results.py "$RUNNER_TEMP/results.json" \
+            src/test/resources/conformance "$BQ_CONFORMANCE_VERSION"
 
   conformance:
     name: Conformance suite in sync
     runs-on: ubuntu-latest
     env:
-      BQ_CONFORMANCE_VERSION: 1.6.0
+      BQ_CONFORMANCE_VERSION: 1.7.0
       # Integrity pin for fetch.sh (sha256 of conformance/fetch.sh at the pinned tag).
       BQ_FETCH_SH_SHA256: 8bb6ba567b288fb0ac71a70fd17041b2503df119e01998d76fdad372570bf849
     steps:
