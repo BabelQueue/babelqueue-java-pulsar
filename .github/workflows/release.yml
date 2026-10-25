@@ -7,8 +7,49 @@ on:
 permissions:
   contents: write
 
+env:
+  BQ_CONFORMANCE_VERSION: "1.7.0"
+
 jobs:
+  # Secret-free: runs the tests, produces results.json and validates it. The PyPI package it
+  # installs never shares a job with the GPG key or the Central credentials.
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: Run tests
+        run: mvn -B --no-transfer-progress verify
+        env:
+          BQ_CONFORMANCE_RESULTS: ${{ runner.temp }}/results.json
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Validate results.json
+        run: |
+          python3 -m pip install --quiet jsonschema==4.23.0
+          python3 -I .github/scripts/check-conformance-results.py "$RUNNER_TEMP/results.json" \
+            src/test/resources/conformance "$BQ_CONFORMANCE_VERSION"
+          cp "$RUNNER_TEMP/results.json" results.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: results
+          path: results.json
+          if-no-files-found: error
+
   release:
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -38,11 +79,12 @@ jobs:
           tar xz -C "$RUNNER_TEMP" -f "$RUNNER_TEMP/maven.tar.gz"
           echo "$RUNNER_TEMP/apache-maven-3.9.11/bin" >> "$GITHUB_PATH"
 
-      - name: Run tests
-        run: mvn -B --no-transfer-progress -v && mvn -B --no-transfer-progress verify
+      - uses: actions/download-artifact@v4
+        with:
+          name: results
 
       - name: Publish to Maven Central
-        run: mvn -B --no-transfer-progress -Prelease -DskipTests deploy
+        run: mvn -B --no-transfer-progress -v && mvn -B --no-transfer-progress -Prelease -DskipTests deploy
         env:
           CENTRAL_TOKEN_USERNAME: ${{ secrets.CENTRAL_TOKEN_USERNAME }}
           CENTRAL_TOKEN_PASSWORD: ${{ secrets.CENTRAL_TOKEN_PASSWORD }}
@@ -52,3 +94,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          files: results.json

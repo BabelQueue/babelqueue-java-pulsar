@@ -20,6 +20,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import org.apache.pulsar.client.api.Consumer;
 import org.apache.pulsar.client.api.Message;
+import org.apache.pulsar.client.api.SubscriptionType;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -72,7 +73,7 @@ class PulsarConsumerTest {
         Consumer<byte[]> consumer = consumerWith(message);
         int[] seen = { -1 };
 
-        int count = PulsarConsumer.builder(consumer)
+        int count = PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared)
             .handler(URN, (env, msg) -> seen[0] = env.attempts())
             .build()
             .poll();
@@ -93,7 +94,7 @@ class PulsarConsumerTest {
     void attemptsReconcilePreservesUnknownTopLevelAndMetaKeys() throws Exception {
         Message<byte[]> message = message(2, jsonWithExtras()); // attempts 0 -> 2
         Envelope[] seen = { null };
-        PulsarConsumer.builder(consumerWith(message))
+        PulsarConsumer.builder(consumerWith(message)).subscriptionType(SubscriptionType.Shared)
             .handler(URN, (env, msg) -> seen[0] = env)
             .build()
             .poll();
@@ -104,18 +105,17 @@ class PulsarConsumerTest {
     }
 
     /**
-     * Core-level lock, not an adapter DLQ test: Pulsar dead-letters natively and the broker keeps the original
-     * body, so this adapter has no path that rewrites the body into a DLQ (it only negative-acknowledges and
-     * leaves dead-lettering to the broker). What the adapter does own is the envelope it hands to
-     * {@code onError}: that must still carry the unknown keys (first two assertions), and the core
-     * {@link DeadLetters#annotate} an application builds on it must keep them (remaining assertions, which
-     * exercise the core, not this adapter).
+     * What the adapter owns here is the envelope it hands to {@code onError}: it must still carry the unknown
+     * keys (first two assertions). The remaining assertions exercise the core {@link DeadLetters#annotate} an
+     * application can build on that envelope. The consumer's own dead-letter write (with a configured producer)
+     * is covered by {@code PulsarConsumerExhaustionTest}. The delivery here is the third (redelivery count 2),
+     * so with the defaults the message is dropped after {@code onError} has been told.
      */
     @Test
     void onErrorEnvelopeKeepsUnknownKeysAndCoreDeadLetterAnnotationRetainsThem() throws Exception {
         Message<byte[]> message = message(2, jsonWithExtras());
         Envelope[] failed = { null };
-        PulsarConsumer.builder(consumerWith(message))
+        PulsarConsumer.builder(consumerWith(message)).subscriptionType(SubscriptionType.Shared)
             .handler(URN, (env, msg) -> { throw new IllegalStateException("boom"); })
             .onError((e, env, msg) -> failed[0] = env)
             .build()
@@ -137,7 +137,7 @@ class PulsarConsumerTest {
     void firstDeliveryIsZeroAttempts() throws Exception {
         Message<byte[]> message = message(0, envelopeJson());
         int[] seen = { -1 };
-        PulsarConsumer.builder(consumerWith(message))
+        PulsarConsumer.builder(consumerWith(message)).subscriptionType(SubscriptionType.Shared)
             .handler(URN, (env, msg) -> seen[0] = env.attempts())
             .build()
             .poll();
@@ -149,7 +149,7 @@ class PulsarConsumerTest {
         // Republish-driven retry carried attempts=5 in the body; redelivery count is only 1.
         Message<byte[]> message = message(1, envelopeJsonWithAttempts(5));
         int[] seen = { -1 };
-        PulsarConsumer.builder(consumerWith(message))
+        PulsarConsumer.builder(consumerWith(message)).subscriptionType(SubscriptionType.Shared)
             .handler(URN, (env, msg) -> seen[0] = env.attempts())
             .build()
             .poll();
@@ -164,7 +164,7 @@ class PulsarConsumerTest {
         Consumer<byte[]> consumer = consumerWith(message);
         String[] routedTo = { null };
 
-        PulsarConsumer.builder(consumer)
+        PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared)
             .handler(URN, (env, msg) -> routedTo[0] = "body")
             .handler(other, (env, msg) -> routedTo[0] = "property")
             .build()
@@ -180,7 +180,7 @@ class PulsarConsumerTest {
         Consumer<byte[]> consumer = consumerWith(message);
         Throwable[] reported = { null };
 
-        PulsarConsumer.builder(consumer)
+        PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared)
             .handler(URN, (env, msg) -> { throw new AssertionError("must not route on the body"); })
             .onError((e, env, msg) -> reported[0] = e)
             .build()
@@ -197,7 +197,7 @@ class PulsarConsumerTest {
         Consumer<byte[]> consumer = consumerWith(message);
         boolean[] called = { false };
 
-        PulsarConsumer.builder(consumer).handler(URN, (env, msg) -> called[0] = true).build().poll();
+        PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared).handler(URN, (env, msg) -> called[0] = true).build().poll();
 
         assertTrue(called[0]);
         verify(consumer).acknowledge(message);
@@ -208,7 +208,7 @@ class PulsarConsumerTest {
         Message<byte[]> message = message(0, envelopeJson(), Map.of("bq-job", "  "));
         boolean[] called = { false };
 
-        PulsarConsumer.builder(consumerWith(message)).handler(URN, (env, msg) -> called[0] = true).build().poll();
+        PulsarConsumer.builder(consumerWith(message)).subscriptionType(SubscriptionType.Shared).handler(URN, (env, msg) -> called[0] = true).build().poll();
 
         assertTrue(called[0]);
     }
@@ -219,7 +219,7 @@ class PulsarConsumerTest {
         Message<byte[]> message = message(1, envelopeJson(), Map.of("bq-attempts", "3"));
         int[] seen = { -1 };
 
-        PulsarConsumer.builder(consumerWith(message))
+        PulsarConsumer.builder(consumerWith(message)).subscriptionType(SubscriptionType.Shared)
             .handler(URN, (env, msg) -> seen[0] = env.attempts())
             .build()
             .poll();
@@ -232,7 +232,7 @@ class PulsarConsumerTest {
         Message<byte[]> message = message(0, envelopeJsonWithAttempts(5), Map.of("bq-attempts", "2"));
         int[] seen = { -1 };
 
-        PulsarConsumer.builder(consumerWith(message))
+        PulsarConsumer.builder(consumerWith(message)).subscriptionType(SubscriptionType.Shared)
             .handler(URN, (env, msg) -> seen[0] = env.attempts())
             .build()
             .poll();
@@ -246,7 +246,7 @@ class PulsarConsumerTest {
         Message<byte[]> message = message(4, envelopeJson(), Map.of("bq-attempts", "1"));
         int[] seen = { -1 };
 
-        PulsarConsumer.builder(consumerWith(message))
+        PulsarConsumer.builder(consumerWith(message)).subscriptionType(SubscriptionType.Shared)
             .handler(URN, (env, msg) -> seen[0] = env.attempts())
             .build()
             .poll();
@@ -260,7 +260,7 @@ class PulsarConsumerTest {
             Message<byte[]> message = message(0, envelopeJsonWithAttempts(5), Map.of("bq-attempts", bad));
             int[] seen = { -1 };
 
-            PulsarConsumer.builder(consumerWith(message))
+            PulsarConsumer.builder(consumerWith(message)).subscriptionType(SubscriptionType.Shared)
                 .handler(URN, (env, msg) -> seen[0] = env.attempts())
                 .build()
                 .poll();
@@ -275,7 +275,7 @@ class PulsarConsumerTest {
         Message<byte[]> message = message(0, envelopeJsonWithAttempts(5), Map.of("bq-attempts", "+3"));
         int[] seen = { -1 };
 
-        PulsarConsumer.builder(consumerWith(message))
+        PulsarConsumer.builder(consumerWith(message)).subscriptionType(SubscriptionType.Shared)
             .handler(URN, (env, msg) -> seen[0] = env.attempts())
             .build()
             .poll();
@@ -292,7 +292,7 @@ class PulsarConsumerTest {
         java.util.List<Throwable> errors = new java.util.ArrayList<>();
         boolean[] called = { false };
 
-        PulsarConsumer.builder(consumer)
+        PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared)
             .handler(other, (env, msg) -> called[0] = true)
             .onError((e, env, msg) -> errors.add(e))
             .onRoutingMismatch((property, body, env, msg) -> mismatches.add(property + "|" + body))
@@ -313,7 +313,7 @@ class PulsarConsumerTest {
         boolean[] called = { false };
         java.util.List<Throwable> errors = new java.util.ArrayList<>();
 
-        int count = PulsarConsumer.builder(consumer)
+        int count = PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared)
             .handler(other, (env, msg) -> called[0] = true)
             .onError((e, env, msg) -> errors.add(e))
             .onRoutingMismatch((property, body, env, msg) -> { throw new IllegalStateException("hook boom"); })
@@ -332,7 +332,7 @@ class PulsarConsumerTest {
         Message<byte[]> message = message(0, envelopeJson(), Map.of("bq-job", "urn:babel:orders:refunded"));
         Consumer<byte[]> consumer = consumerWith(message);
 
-        PulsarConsumer.builder(consumer).handler("urn:babel:orders:refunded", (env, msg) -> { }).build().poll();
+        PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared).handler("urn:babel:orders:refunded", (env, msg) -> { }).build().poll();
 
         verify(consumer).acknowledge(message);
     }
@@ -342,7 +342,7 @@ class PulsarConsumerTest {
         Message<byte[]> message = message(0, envelopeJson(), Map.of("bq-job", URN));
         java.util.List<Throwable> reported = new java.util.ArrayList<>();
 
-        PulsarConsumer.builder(consumerWith(message))
+        PulsarConsumer.builder(consumerWith(message)).subscriptionType(SubscriptionType.Shared)
             .handler(URN, (env, msg) -> { })
             .onRoutingMismatch((property, body, env, msg) -> reported.add(new IllegalStateException(property)))
             .build()
@@ -360,7 +360,7 @@ class PulsarConsumerTest {
         Consumer<byte[]> consumer = consumerWith(message);
         Throwable[] reported = { null };
 
-        PulsarConsumer.builder(consumer)
+        PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared)
             .handler(URN, (env, msg) -> { throw new AssertionError("must not reach the handler"); })
             .onError((e, env, msg) -> reported[0] = e)
             .build()
@@ -377,7 +377,7 @@ class PulsarConsumerTest {
         Consumer<byte[]> consumer = consumerWith(message);
         Throwable[] reported = { null };
 
-        PulsarConsumer.builder(consumer)
+        PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared)
             .handler(URN, (env, msg) -> { throw new IllegalStateException("boom"); })
             .onError((e, env, msg) -> reported[0] = e)
             .build()
@@ -394,7 +394,7 @@ class PulsarConsumerTest {
         Consumer<byte[]> consumer = consumerWith(message);
         boolean[] called = { false };
 
-        PulsarConsumer.builder(consumer)
+        PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared)
             .onUnknownUrn((env, msg) -> called[0] = true)
             .build()
             .poll();
@@ -409,7 +409,7 @@ class PulsarConsumerTest {
         Consumer<byte[]> consumer = consumerWith(message);
         Throwable[] reported = { null };
 
-        PulsarConsumer.builder(consumer).onError((e, env, msg) -> reported[0] = e).build().poll();
+        PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared).onError((e, env, msg) -> reported[0] = e).build().poll();
 
         assertInstanceOf(UnknownUrnException.class, reported[0]);
         verify(consumer).negativeAcknowledge(message);
@@ -424,7 +424,7 @@ class PulsarConsumerTest {
         Consumer<byte[]> consumer = consumerWith(message);
         Throwable[] reported = { null };
 
-        PulsarConsumer.builder(consumer).onError((e, env, msg) -> reported[0] = e).build().poll();
+        PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared).onError((e, env, msg) -> reported[0] = e).build().poll();
 
         assertInstanceOf(BabelQueueException.class, reported[0]);
         verify(consumer).negativeAcknowledge(message);
@@ -436,7 +436,7 @@ class PulsarConsumerTest {
         Consumer<byte[]> consumer = consumerWith(message);
         int[] delivered = { 0 };
 
-        PulsarConsumer.builder(consumer).handler(URN, (env, msg) -> delivered[0]++).build().poll();
+        PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared).handler(URN, (env, msg) -> delivered[0]++).build().poll();
 
         assertEquals(1, delivered[0]);
         verify(consumer).acknowledge(message);
@@ -450,7 +450,7 @@ class PulsarConsumerTest {
         Consumer<byte[]> consumer = consumerWith(message);
         int[] delivered = { 0 };
 
-        PulsarConsumer.builder(consumer).handler(URN, (env, msg) -> delivered[0]++).build().poll();
+        PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared).handler(URN, (env, msg) -> delivered[0]++).build().poll();
 
         assertEquals(1, delivered[0]);
         verify(consumer).acknowledge(message);
@@ -463,7 +463,7 @@ class PulsarConsumerTest {
         Consumer<byte[]> consumer = consumerWith(message);
         int[] delivered = { 0 };
 
-        PulsarConsumer.builder(consumer).handler(URN, (env, msg) -> delivered[0]++).build().poll();
+        PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared).handler(URN, (env, msg) -> delivered[0]++).build().poll();
 
         assertEquals(1, delivered[0]);
         verify(consumer).acknowledge(message);
@@ -481,7 +481,7 @@ class PulsarConsumerTest {
         Envelope[] reportedEnvelope = { null };
         int[] delivered = { 0 };
 
-        int count = PulsarConsumer.builder(consumer)
+        int count = PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared)
             .handler(URN, (env, msg) -> delivered[0]++)
             .onError((e, env, msg) -> {
                 reported[0] = e;
@@ -507,7 +507,7 @@ class PulsarConsumerTest {
         Consumer<byte[]> consumer = consumerWith(message);
         int[] delivered = { 0 };
 
-        PulsarConsumer.builder(consumer).handler(URN, (env, msg) -> delivered[0]++).build().poll();
+        PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared).handler(URN, (env, msg) -> delivered[0]++).build().poll();
 
         assertEquals(0, delivered[0]);
         verify(consumer).negativeAcknowledge(message);
@@ -520,7 +520,7 @@ class PulsarConsumerTest {
         Consumer<byte[]> consumer = consumerWith(message);
         Throwable[] reported = { null };
 
-        PulsarConsumer.builder(consumer).onError((e, env, msg) -> reported[0] = e).build().poll();
+        PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared).onError((e, env, msg) -> reported[0] = e).build().poll();
 
         assertInstanceOf(BabelQueueException.class, reported[0]);
         assertTrue(reported[0].getMessage().contains("non-conformant"), reported[0].getMessage());
@@ -533,7 +533,7 @@ class PulsarConsumerTest {
         Consumer<byte[]> consumer = mock(Consumer.class);
         when(consumer.receive(anyInt(), any())).thenReturn(null);
 
-        int count = PulsarConsumer.builder(consumer).build().poll();
+        int count = PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared).build().poll();
 
         assertEquals(0, count);
     }
@@ -542,7 +542,7 @@ class PulsarConsumerTest {
     @SuppressWarnings("unchecked")
     void runStopsWhenSupplierIsFalse() throws Exception {
         Consumer<byte[]> consumer = mock(Consumer.class);
-        PulsarConsumer.builder(consumer).build().run(() -> false);
+        PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared).build().run(() -> false);
         verify(consumer, never()).receive(anyInt(), any());
     }
 
@@ -552,7 +552,7 @@ class PulsarConsumerTest {
         Consumer<byte[]> consumer = consumerWith(message);
         int[] seen = { -1 };
 
-        PulsarConsumer.builder(consumer)
+        PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared)
             .handlers(Map.of(URN, (env, msg) -> seen[0] = env.attempts()))
             .receiveTimeout(250)
             .build()
@@ -572,7 +572,7 @@ class PulsarConsumerTest {
         Throwable[] reported = { null };
         boolean[] firstPass = { true };
 
-        PulsarConsumer.builder(consumer)
+        PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared)
             .onError((e, env, msg) -> reported[0] = e)
             .build()
             .run(() -> {
@@ -592,7 +592,7 @@ class PulsarConsumerTest {
         Consumer<byte[]> consumer = mock(Consumer.class);
         Thread.currentThread().interrupt();
         try {
-            PulsarConsumer.builder(consumer).build().run();
+            PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared).build().run();
         } finally {
             // Clear the interrupted flag so it does not leak into other tests.
             Thread.interrupted();

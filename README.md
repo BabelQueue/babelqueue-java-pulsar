@@ -15,7 +15,7 @@ the .NET, Python, Go and Node SDKs. Implements
 <dependency>
   <groupId>com.babelqueue</groupId>
   <artifactId>babelqueue-pulsar</artifactId>
-  <version>1.1.1</version>
+  <version>1.2.0</version>
 </dependency>
 ```
 
@@ -52,7 +52,7 @@ property (produced outside BabelQueue) falls back to the body's `job`/`urn`.
 Before decoding the body, the consumer version-gates on the `bq-schema-version` property
 (§5.7 step 3): a value that is not exactly the schema version the core supports, compared exactly as sent with no
 trimming (`"2"`, `"x"`, `"01"`, `" 1"`, …) is rejected without decoding — `onError` is called with a `null` envelope and the
-message is `negativeAcknowledge`d, the same path as a non-conformant envelope. A missing or blank (empty or
+message is `negativeAcknowledge`d (this gate is not bounded by `maxAttempts`). A missing or blank (empty or
 ASCII-whitespace-only: space, tab, LF, VT, FF, CR; NBSP, U+0085, U+FEFF etc. are not blank) property changes nothing; a `"1"` property still goes through the post-decode `accepts()` check.
 
 ## Contract mapping (§5)
@@ -75,11 +75,60 @@ absent or does not match `^[0-9]+$` — ASCII digits only, no sign/whitespace, w
 `getRedeliveryCount()` is 0-based (0 on first delivery) so it maps directly to `attempts`
 with **no −1**, and the `max` never lowers the carried-over count — so a republish-driven retry
 (Go/Python transports increment `bq-attempts` and re-send) and a native negative-ack redelivery
-both converge on the same number. A throwing handler `negativeAcknowledge`s the message, so
-the broker redelivers it (at-least-once); with a native `DeadLetterPolicy` it eventually moves
-to the cross-language `<queue>.dlq` topic. The poll loop never stops on a bad message — observe
+both converge on the same number. The poll loop never stops on a bad message — observe
 via `onError`/`onUnknownUrn`. If `bq-job` differs from the body's `job`, the property still routes and the optional `onRoutingMismatch` hook is called with the property URN, body URN and envelope/message (a throwing hook is swallowed; settling is unaffected; `onError` is not involved). The envelope is unchanged (`schema_version` stays `1`); Pulsar is
 purely additive.
+
+## Max attempts, dead-letter and poison (ADR-0036)
+
+Pulsar has no broker-side redelivery limit and this SDK sets no native `DeadLetterPolicy`, so the bound is
+SDK-owned. `maxAttempts` (default **3**) is the total number of deliveries a message gets, the first included
+(`1` means no retry; below 1 is rejected). Each delivery is counted as `reconciled attempts + 1`; a throwing
+handler, an unmapped URN without an `onUnknownUrn` hook and a poison body are retried while
+`counted < maxAttempts`, then exhausted. A retry is one of two things:
+
+- a **re-publish** to the same topic with `bq-attempts = counted` (the body's `attempts` in sync, other properties
+  kept; a poison body byte for byte) followed by an acknowledgement. The SDK counts attempts itself, so this works on
+  **every subscription type**. Give the consumer a `client(PulsarClient)` and it creates the retry producer itself
+  (one per topic, on the first retry; `consumer.close()` closes them), or pass your own with `retryProducer(...)`
+  (which wins over the client);
+- a **`negativeAcknowledge`**, only for `Shared` and `Key_Shared` subscriptions, where the broker advances
+  `getRedeliveryCount()`.
+
+Pulsar does not track redeliveries for `Exclusive` (the Java client's default) and `Failover` subscriptions: the count
+stays 0 there and a negative acknowledgement would redeliver forever. So `build()` **throws `IllegalStateException`**
+unless you give a `retryProducer`, a `client`, or declare `subscriptionType(SubscriptionType.Shared)` /
+`Key_Shared` (the `Consumer` interface does not expose its subscription type, so you declare it; undeclared is treated
+as the client default, `Exclusive`). No configuration is left unbounded.
+
+```java
+Producer<byte[]> dlq = client.newProducer().topic("orders.dlq").create();
+PulsarConsumer consumer = PulsarConsumer.builder(sub)
+    .handler("urn:babel:orders:created", handler)
+    .maxAttempts(5)             // default 3
+    .client(client)             // retries re-publish via a producer the consumer creates (any subscription type)
+    // or: .subscriptionType(SubscriptionType.Shared) to retry by negativeAcknowledge instead
+    .deadLetterProducer(dlq)    // opt-in; without it an exhausted message is acknowledged, dropped and logged
+    .build();
+```
+
+| Exhausted, dead-letter producer | Result |
+| :--- | :--- |
+| set | the envelope + `dead_letter` block (`reason` `failed` / `unknown_urn`, `attempts` = counted) is sent to `<queue>.dlq`, then the original is acknowledged. A failed write negative-acknowledges it (redelivered, written again) |
+| not set | acknowledged and dropped, logged at `WARNING` |
+
+A **poison** body never reaches a handler. Here poison means: not valid UTF-8, not a JSON object, or an object the
+core decoder reads but `EnvelopeCodec.accepts` rejects (no `job`/`urn`, or no `data`, no `meta`, a blank `trace_id`, a
+`schema_version` other than 1). This is **not** identical to the `identity_verdict` conformance table (Go's typed
+decode): a body such as `{"urn":"urn:x"}` is `ok` there but poison here, and a body with a wrongly typed known member
+(`"attempts":"3"`) is `poison` there but decoded leniently here (a known cross-SDK gap, to be settled in the Java core). With a dead-letter producer it goes to the DLQ at once, without retry, in the
+ADR-0035 shape (`reason: "poison"`, the original body preserved byte for byte); without
+one it takes the bounded retry, then is dropped.
+
+**Upgrading:** before this release a failing message was redelivered without a limit; with the defaults it is now
+dropped at its third delivery. Raise `maxAttempts` to retry longer and set `deadLetterProducer` to keep what is
+exhausted. `build()` now also requires `client(...)`, `retryProducer(...)` or a declared `Shared`/`Key_Shared`
+`subscriptionType(...)` (see above). A message rejected by the `bq-schema-version` gate is unchanged (negative acknowledgement).
 
 ## Build & test
 
