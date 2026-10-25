@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-25
+
 Implements ADR-0036 decisions 1 and 2 (post-R1 parity). The envelope stays at `schema_version: 1`.
 
 ### Changed (behaviour change)
