@@ -45,8 +45,11 @@ import org.apache.pulsar.client.api.TypedMessageBuilder;
  * decoded: when it is present and is not exactly the schema version the core supports
  * ({@link EnvelopeCodec#SCHEMA_VERSION}, compared exactly as sent, as its canonical decimal string, with no
  * trimming — so {@code "2"}, {@code "x"}, {@code "01"} and {@code " 1"} are all unknown), the body is never decoded or routed; {@code onError}
- * is notified (with a {@code null} envelope) and the message is {@code negativeAcknowledge}d; this gate is
- * outside the max-attempts bound below. A missing or blank (empty or ASCII-whitespace-only: space, tab, LF, VT, FF, CR) property changes nothing, and a
+ * is notified (with a {@code null} envelope) and the message is settled on its <b>first</b> delivery
+ * (ADR-0037 decision 1; outside the max-attempts bound below, no retry): with a {@link Builder#deadLetterProducer
+ * dead-letter producer} the body is written to the DLQ exactly as received (no {@code dead_letter} block) and then
+ * acknowledged — a failed write {@code negativeAcknowledge}s it, so the write is retried; without one it is
+ * acknowledged and the drop is logged. The gate reads no strategy ({@code onUnknownUrn} never affects it). A missing or blank (empty or ASCII-whitespace-only: space, tab, LF, VT, FF, CR) property changes nothing, and a
  * {@code "1"} property still goes through the post-decode {@link EnvelopeCodec#accepts} check.
  *
  * <h2>Max attempts and poison (ADR-0036, broker-bindings §5.5)</h2>
@@ -175,10 +178,7 @@ public final class PulsarConsumer {
         String declaredVersion = rawProperty(properties, SCHEMA_VERSION_PROPERTY);
         if (declaredVersion != null && !isBlankSchemaVersion(declaredVersion)
             && !declaredVersion.equals(Integer.toString(EnvelopeCodec.SCHEMA_VERSION))) {
-            report(new BabelQueueException("Rejected a Pulsar message: unsupported "
-                + SCHEMA_VERSION_PROPERTY + " property '" + declaredVersion + "' (supported: "
-                + EnvelopeCodec.SCHEMA_VERSION + "); body not decoded."), null, message);
-            consumer.negativeAcknowledge(message);
+            settleVersionGated(message, declaredVersion);
             return;
         }
 
@@ -264,6 +264,32 @@ public final class PulsarConsumer {
             return;
         }
         writeDeadLetterAndAcknowledge(message, envelope, record, properties);
+    }
+
+    /**
+     * Settles a version-gated delivery on its first delivery (ADR-0037 decision 1, broker-bindings §5.7): the body is
+     * never decoded, no handler or {@code onUnknownUrn} hook runs and nothing is retried, whatever {@code bq-attempts},
+     * the redelivery count or {@code maxAttempts} say. This consumer has no unknown-URN strategy option, so the
+     * configured strategy is {@code fail}: with a {@link Builder#deadLetterProducer dead-letter producer} the body is
+     * written to the DLQ <b>exactly as received</b> (no {@code dead_letter} block, no re-encoding) and the original is
+     * acknowledged only after the write succeeded (a failed write negative-acknowledges it, so the gate rejects the
+     * redelivery again and the write is retried); without one the delivery is acknowledged and the drop is logged.
+     */
+    private void settleVersionGated(Message<byte[]> message, String declaredVersion) throws PulsarClientException {
+        BabelQueueException cause = new BabelQueueException("Rejected a Pulsar message: unsupported "
+            + SCHEMA_VERSION_PROPERTY + " property '" + declaredVersion + "' (supported: "
+            + EnvelopeCodec.SCHEMA_VERSION + "); body not decoded.");
+        report(cause, null, message);
+        if (deadLetterProducer == null) {
+            LOGGER.log(System.Logger.Level.WARNING,
+                "BabelQueue Pulsar: dropped a version-gated message from {0} (no dead-letter producer configured): {1}",
+                queueName(message), cause.getMessage());
+            consumer.acknowledge(message);
+            return;
+        }
+        byte[] body = message.getValue() == null ? new byte[0] : message.getValue();
+        Map<String, String> original = message.getProperties();
+        writeDeadLetterAndAcknowledge(message, null, body, original == null ? Map.of() : original);
     }
 
     /**

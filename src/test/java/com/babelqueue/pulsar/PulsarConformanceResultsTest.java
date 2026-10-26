@@ -27,10 +27,12 @@ class PulsarConformanceResultsTest {
     @Test
     void inScopeSectionsAreExactlyTheManifestsPulsarScopedOnes() throws Exception {
         Map<String, List<String>> expected = PulsarConformanceResults.expectedCases(manifest());
-        assertEquals(java.util.Set.of("pulsar", "pulsar_exhaustion"), expected.keySet());
+        assertEquals(java.util.Set.of("pulsar", "pulsar_exhaustion", "version_gate_pulsar"), expected.keySet());
         assertTrue(expected.get("pulsar").contains("property_projection"));
         assertTrue(expected.get("pulsar").contains("schema_version_gate/0"));
         assertTrue(expected.get("pulsar_exhaustion").contains("failed-reconciled-2-dlq-on-dead-letters"));
+        assertEquals(17, expected.get("version_gate_pulsar").size());
+        assertTrue(expected.get("version_gate_pulsar").contains("default-dlq-on-write-ok"));
     }
 
     @Test

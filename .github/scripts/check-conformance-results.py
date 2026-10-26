@@ -4,13 +4,14 @@
 usage: check-conformance-results.py <results.json> <vendor-dir> <expected-conformance-version>
 
 This package carries the `pulsar` binding only, so the in-scope manifest sections are those whose
-scope is `pulsar` (`pulsar`, `pulsar_exhaustion`); the `core` sections are run and reported by
+scope is `pulsar` (`pulsar`, `pulsar_exhaustion`, `version_gate_pulsar`); the `core` sections are run and reported by
 babelqueue-core. Fails (exit 1) when results.json
   * does not conform to schema/results.schema.json,
   * reports a conformance_version other than the pinned one, or bindings other than ["pulsar"],
-  * has a `fail` case, or a `skip` other than a `pulsar_exhaustion` row that carries an
-    `on_unknown_urn` strategy (this consumer has no such option; ADR-0036 decision 1 tells the Java,
-    .NET and Node runners to skip those rows) and cites ADR-0036,
+  * has a `fail` case, or a `skip` other than a `pulsar_exhaustion` / `version_gate_pulsar` row that
+    carries an `on_unknown_urn` strategy (this consumer has no such option; ADR-0036 decision 1 and
+    ADR-0037 decision 1 tell the Java, .NET and Node runners to skip those rows; a `version_gate_pulsar`
+    row with strategy `fail` is asserted, not skipped) and cites the ADR (ADR-0036 / ADR-0037),
   * omits a pulsar-scope section or a case id that the manifest defines for it, or lists a section
     that is not in scope.
 """
@@ -78,21 +79,29 @@ def main():
     if bad:
         errors.append("fail cases: " + ", ".join(bad))
 
-    strategy_rows = {
-        c["name"] for c in manifest["pulsar_exhaustion"]["cases"] if "on_unknown_urn" in c
+    # section -> (ADR that authorises the skip, rows that carry a non-default on_unknown_urn strategy)
+    skippable = {
+        "pulsar_exhaustion": ("ADR-0036", {
+            c["name"] for c in manifest["pulsar_exhaustion"]["cases"] if "on_unknown_urn" in c
+        }),
+        "version_gate_pulsar": ("ADR-0037", {
+            c["name"] for c in manifest["version_gate_pulsar"]["cases"]
+            if c.get("on_unknown_urn", "fail") != "fail"
+        }),
     }
     for s, cs in sections.items():
         for i, r in cs.items():
             if r.get("status") != "skip":
                 continue
-            if s != "pulsar_exhaustion" or i not in strategy_rows:
+            if s not in skippable or i not in skippable[s][1]:
                 errors.append(f"skip {s}/{i} is not an on_unknown_urn strategy row")
-            elif "ADR-0036" not in r.get("reason", ""):
-                errors.append(f"skip {s}/{i} does not cite ADR-0036")
-    skipped = {i for i, r in sections.get("pulsar_exhaustion", {}).items() if r.get("status") == "skip"}
-    if skipped != strategy_rows:
-        errors.append("the on_unknown_urn strategy rows must be reported as skip, not pass: "
-                      + ", ".join(sorted(strategy_rows ^ skipped)))
+            elif skippable[s][0] not in r.get("reason", ""):
+                errors.append(f"skip {s}/{i} does not cite {skippable[s][0]}")
+    for s, (_, rows) in skippable.items():
+        skipped = {i for i, r in sections.get(s, {}).items() if r.get("status") == "skip"}
+        if skipped != rows:
+            errors.append(f"the {s} on_unknown_urn strategy rows must be reported as skip, not pass: "
+                          + ", ".join(sorted(rows ^ skipped)))
 
     if errors:
         print("results.json check FAILED:", file=sys.stderr)

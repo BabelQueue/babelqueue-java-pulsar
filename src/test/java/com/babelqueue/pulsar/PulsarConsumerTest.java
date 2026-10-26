@@ -496,8 +496,9 @@ class PulsarConsumerTest {
         assertTrue(reported[0].getMessage().contains("bq-schema-version"), reported[0].getMessage());
         assertTrue(reported[0].getMessage().contains("'" + version + "'"), reported[0].getMessage());
         assertNull(reportedEnvelope[0]);
-        verify(consumer).negativeAcknowledge(message);
-        verify(consumer, never()).acknowledge(any(Message.class));
+        // ADR-0037 decision 1: settled on the first delivery; no DLQ producer, so it is acknowledged and dropped.
+        verify(consumer).acknowledge(message);
+        verify(consumer, never()).negativeAcknowledge(any(Message.class));
         verify(message, never()).getValue();
     }
 
@@ -510,7 +511,91 @@ class PulsarConsumerTest {
         PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared).handler(URN, (env, msg) -> delivered[0]++).build().poll();
 
         assertEquals(0, delivered[0]);
+        verify(consumer).acknowledge(message);
+        verify(consumer, never()).negativeAcknowledge(any(Message.class));
+    }
+
+    @Test
+    void versionGatedWithDeadLetterProducerWritesTheRawBodyThenAcknowledges() throws Exception {
+        // Deliberately non-canonical bytes: a writer that decodes and re-encodes would change them.
+        String raw = "{\"meta\": {\"schema_version\": 2}, \"job\": \"" + URN + "\", \"data\": {\"big\": 12345678901234567890}}\n";
+        Message<byte[]> message = message(7, raw, Map.of("bq-job", URN, "bq-schema-version", "2", "bq-attempts", "7"));
+        Consumer<byte[]> consumer = consumerWith(message);
+        DeadLetterProbe dlq = new DeadLetterProbe();
+        int[] delivered = { 0 };
+        int[] unknown = { 0 };
+
+        PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared)
+            .handler(URN, (env, msg) -> delivered[0]++)
+            .onUnknownUrn((env, msg) -> unknown[0]++)
+            .deadLetterProducer(dlq.producer)
+            .build()
+            .poll();
+
+        assertEquals(0, delivered[0]);
+        assertEquals(0, unknown[0]);
+        assertEquals(1, dlq.sends());
+        assertEquals(raw, dlq.lastRecord());
+        assertTrue(!dlq.lastRecord().contains("dead_letter"));
+        verify(consumer).acknowledge(message);
+        verify(consumer, never()).negativeAcknowledge(any(Message.class));
+    }
+
+    @Test
+    void versionGatedFailedDeadLetterWriteLeavesItUnsettledAndReports() throws Exception {
+        Message<byte[]> message = message(0, "plain text, not JSON  \t ", Map.of("bq-schema-version", "2"));
+        Consumer<byte[]> consumer = consumerWith(message);
+        DeadLetterProbe dlq = new DeadLetterProbe();
+        dlq.failWith(new org.apache.pulsar.client.api.PulsarClientException("broker down"));
+        java.util.List<Throwable> reported = new java.util.ArrayList<>();
+
+        PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared)
+            .deadLetterProducer(dlq.producer)
+            .onError((e, env, msg) -> reported.add(e))
+            .build()
+            .poll();
+
         verify(consumer).negativeAcknowledge(message);
+        verify(consumer, never()).acknowledge(any(Message.class));
+        assertEquals(2, reported.size());
+        assertTrue(reported.get(0).getMessage().contains("bq-schema-version"));
+        assertEquals("broker down", reported.get(1).getMessage());
+    }
+
+    @Test
+    void versionGatedHookOnlyConsumerWithoutDeadLetterDropsAndNeverCallsTheHook() throws Exception {
+        // A hook never affects a version-gated delivery (ADR-0037, "Configured strategy only").
+        Message<byte[]> message = message(0, envelopeJson(), Map.of("bq-job", URN, "bq-schema-version", "2"));
+        Consumer<byte[]> consumer = consumerWith(message);
+        int[] unknown = { 0 };
+
+        PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared)
+            .onUnknownUrn((env, msg) -> unknown[0]++)
+            .build()
+            .poll();
+
+        assertEquals(0, unknown[0]);
+        verify(consumer).acknowledge(message);
+        verify(consumer, never()).negativeAcknowledge(any(Message.class));
+    }
+
+    @Test
+    void versionGatedHookOnlyConsumerWithDeadLetterWritesTheRawRecord() throws Exception {
+        String body = envelopeJson();
+        Message<byte[]> message = message(0, body, Map.of("bq-job", URN, "bq-schema-version", "2"));
+        Consumer<byte[]> consumer = consumerWith(message);
+        DeadLetterProbe dlq = new DeadLetterProbe();
+        int[] unknown = { 0 };
+
+        PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared)
+            .onUnknownUrn((env, msg) -> unknown[0]++)
+            .deadLetterProducer(dlq.producer)
+            .build()
+            .poll();
+
+        assertEquals(0, unknown[0]);
+        assertEquals(body, dlq.lastRecord());
+        verify(consumer).acknowledge(message);
     }
 
     @Test

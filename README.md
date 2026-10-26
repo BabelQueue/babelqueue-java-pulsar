@@ -15,7 +15,7 @@ the .NET, Python, Go and Node SDKs. Implements
 <dependency>
   <groupId>com.babelqueue</groupId>
   <artifactId>babelqueue-pulsar</artifactId>
-  <version>1.2.0</version>
+  <version>1.3.0</version>
 </dependency>
 ```
 
@@ -52,7 +52,11 @@ property (produced outside BabelQueue) falls back to the body's `job`/`urn`.
 Before decoding the body, the consumer version-gates on the `bq-schema-version` property
 (§5.7 step 3): a value that is not exactly the schema version the core supports, compared exactly as sent with no
 trimming (`"2"`, `"x"`, `"01"`, `" 1"`, …) is rejected without decoding — `onError` is called with a `null` envelope and the
-message is `negativeAcknowledge`d (this gate is not bounded by `maxAttempts`). A missing or blank (empty or
+message is settled on its **first** delivery (ADR-0037; never retried, outside `maxAttempts`): with a
+`deadLetterProducer` the body is sent to `<queue>.dlq` **exactly as received** (no `dead_letter` block) and then
+acknowledged — a failed write negative-acknowledges it, so the gate rejects the redelivery again and the write is
+retried; without one it is acknowledged and the drop is logged at `WARNING`. This consumer has no unknown-URN
+strategy option (it behaves as `fail`) and an `onUnknownUrn` hook never affects a gated message. A missing or blank (empty or
 ASCII-whitespace-only: space, tab, LF, VT, FF, CR; NBSP, U+0085, U+FEFF etc. are not blank) property changes nothing; a `"1"` property still goes through the post-decode `accepts()` check.
 
 ## Contract mapping (§5)
@@ -128,7 +132,8 @@ one it takes the bounded retry, then is dropped.
 **Upgrading:** before this release a failing message was redelivered without a limit; with the defaults it is now
 dropped at its third delivery. Raise `maxAttempts` to retry longer and set `deadLetterProducer` to keep what is
 exhausted. `build()` now also requires `client(...)`, `retryProducer(...)` or a declared `Shared`/`Key_Shared`
-`subscriptionType(...)` (see above). A message rejected by the `bq-schema-version` gate is unchanged (negative acknowledgement).
+`subscriptionType(...)` (see above). A message rejected by the `bq-schema-version` gate used to be negatively acknowledged without a limit; it is now
+settled on its first delivery (raw body to the DLQ and acknowledged, or acknowledged and dropped without a DLQ producer).
 
 ## Build & test
 
