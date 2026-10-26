@@ -9,6 +9,12 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.3.1] - 2026-10-26
+
+### Changed
+
+- The poison `dead_letter` block is now built by core `PoisonRecord.build(body, originalQueue, attempts, error, exception)` (babelqueue-core 1.14.0) instead of by hand; the DLQ record is byte-for-byte unchanged (`reason: "poison"`, `failed_at`, `lang: "java"`).
+
 ## [1.3.0] - 2026-10-26
 
 MINOR (ADR-0037 decision 1). The envelope stays at `schema_version: 1`.

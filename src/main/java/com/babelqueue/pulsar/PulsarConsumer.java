@@ -4,7 +4,6 @@ import com.babelqueue.BabelQueueException;
 import com.babelqueue.DeadLetters;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
-import com.babelqueue.JsonValues;
 import com.babelqueue.PoisonRecord;
 import com.babelqueue.UnknownUrnException;
 import java.nio.ByteBuffer;
@@ -312,15 +311,8 @@ public final class PulsarConsumer {
         }
         byte[] record;
         try {
-            Map<String, Object> block = new LinkedHashMap<>();
-            block.put("reason", "poison");
-            block.put("error", cause.getMessage());
-            block.put("exception", cause.getClass().getName());
-            block.put("failed_at", System.currentTimeMillis());
-            block.put("original_queue", queueName(message));
-            block.put("attempts", reconciled);
-            block.put("lang", EnvelopeCodec.SOURCE_LANG);
-            record = PoisonRecord.build(body, JsonValues.encode(block)).getBytes(StandardCharsets.UTF_8);
+            record = PoisonRecord.build(body, queueName(message), reconciled, cause.getMessage(),
+                cause.getClass().getName()).getBytes(StandardCharsets.UTF_8);
         } catch (RuntimeException error) {
             leaveUnsettled(message, partial, error);
             return;
