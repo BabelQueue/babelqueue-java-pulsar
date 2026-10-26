@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 env:
-  BQ_CONFORMANCE_VERSION: "1.7.0"
+  BQ_CONFORMANCE_VERSION: "1.8.0"
 
 jobs:
   # Secret-free: runs the tests, produces results.json and validates it. The PyPI package it
