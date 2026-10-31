@@ -683,4 +683,61 @@ class PulsarConsumerTest {
             Thread.interrupted();
         }
     }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void deliveredTraceparentPropertyReachesTheHandlerViaHeadersOfAndNotTheBody() throws Exception {
+        String traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        Message<byte[]> message = message(0, envelopeJson(),
+            Map.of("bq-job", URN, "traceparent", traceparent));
+        Map<String, String>[] seen = new Map[]{null};
+
+        PulsarConsumer.builder(consumerWith(message)).subscriptionType(SubscriptionType.Shared)
+            .handler(URN, (e, m) -> seen[0] = BabelHandler.headersOf(m))
+            .build()
+            .poll();
+
+        assertEquals(traceparent, seen[0].get("traceparent"));
+        assertEquals(URN, seen[0].get("bq-job"));
+        assertTrue(!envelopeJson().contains("traceparent"));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void publisherOutputRoundTripsTraceparentToTheHandlerViaHeadersOf() throws Exception {
+        String traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        org.apache.pulsar.client.api.Producer<byte[]> producer = mock(org.apache.pulsar.client.api.Producer.class);
+        when(producer.getTopic()).thenReturn("orders");
+        org.apache.pulsar.client.api.TypedMessageBuilder<byte[]> builder =
+            mock(org.apache.pulsar.client.api.TypedMessageBuilder.class);
+        when(producer.newMessage()).thenReturn(builder);
+        when(builder.value(any())).thenReturn(builder);
+        when(builder.property(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString()))
+            .thenReturn(builder);
+        when(builder.send()).thenReturn(mock(org.apache.pulsar.client.api.MessageId.class));
+        PulsarPublisher.create(producer).publish(URN, Map.of("order_id", 1), "trace-1", null,
+            Map.of("traceparent", traceparent));
+
+        org.mockito.ArgumentCaptor<byte[]> value = org.mockito.ArgumentCaptor.forClass(byte[].class);
+        org.mockito.Mockito.verify(builder).value(value.capture());
+        org.mockito.ArgumentCaptor<String> keys = org.mockito.ArgumentCaptor.forClass(String.class);
+        org.mockito.ArgumentCaptor<String> vals = org.mockito.ArgumentCaptor.forClass(String.class);
+        org.mockito.Mockito.verify(builder, org.mockito.Mockito.atLeastOnce()).property(keys.capture(), vals.capture());
+        Map<String, String> sentProperties = new java.util.HashMap<>();
+        for (int i = 0; i < keys.getAllValues().size(); i++) {
+            sentProperties.put(keys.getAllValues().get(i), vals.getAllValues().get(i));
+        }
+        String sentBody = new String(value.getValue(), StandardCharsets.UTF_8);
+        Map<String, String>[] seen = new Map[]{null};
+
+        // the broker hands the publisher's exact body and properties back
+        PulsarConsumer.builder(consumerWith(message(0, sentBody, sentProperties)))
+            .subscriptionType(SubscriptionType.Shared)
+            .handler(URN, (e, m) -> seen[0] = BabelHandler.headersOf(m))
+            .build()
+            .poll();
+
+        assertEquals(traceparent, seen[0].get("traceparent"));
+        assertTrue(!sentBody.contains("traceparent"));
+    }
 }
