@@ -916,4 +916,53 @@ class PulsarConsumerTest {
             new DeadLetterEvent("billing", DLQ_TOPIC, "failed"),
             new DeadLetterEvent("orders", DLQ_TOPIC, "poison")), events);
     }
+
+    @Test
+    void eventQueueFallbackTreatsOnlyTheAsciiWhitespaceSetAsBlank() throws Exception {
+        String json = EnvelopeCodec.encode(EnvelopeCodec.make(URN, Map.of("order_id", 1), "billing", null));
+        // meta.queue as JSON text -> the queue the event must report. Only the ASCII whitespace set is blank (ADR-0031):
+        // Unicode spaces and control characters (Character.isWhitespace) are real, non-blank names.
+        String[][] cases = {
+            {" \\t", "orders"}, {"", "orders"}, {"\\u000b\\f\\r", "orders"},
+            {"\\u2003", "\u2003"}, {"\\u00a0", "\u00a0"}, {"\\u001c", "\u001c"}, {"\\u0085", "\u0085"},
+        };
+        for (String[] c : cases) {
+            java.util.List<DeadLetterEvent> events = new java.util.ArrayList<>();
+
+            PulsarConsumer.builder(consumerWith(onTopic(message(2, json.replace("\"queue\":\"billing\"", "\"queue\":\"" + c[0] + "\"")))))
+                .subscriptionType(SubscriptionType.Shared)
+                .deadLetterProducer(probe().producer)
+                .deadLetterObserver(events::add)
+                .build()
+                .poll();
+
+            assertEquals(1, events.size(), c[0]);
+            assertEquals(c[1], events.get(0).queue(), "meta.queue=" + c[0]);
+        }
+    }
+
+    @Test
+    void theDlqRecordOriginalQueueKeepsItsOwnBlankRuleWhileTheEventUsesTheAsciiSet() throws Exception {
+        // U+2003 and U+001C are Character.isWhitespace but not ADR-0031 blank: the event reports them as given, while the
+        // record's dead_letter.original_queue (wire data) is unchanged from before and still falls back to the topic.
+        String json = EnvelopeCodec.encode(EnvelopeCodec.make(URN, Map.of("order_id", 1), "billing", null));
+        for (String queue : new String[] {"\\u2003", "\\u001c"}) {
+            DeadLetterProbe dlq = probe();
+            java.util.List<DeadLetterEvent> events = new java.util.ArrayList<>();
+
+            PulsarConsumer.builder(consumerWith(onTopic(message(2,
+                    json.replace("\"queue\":\"billing\"", "\"queue\":\"" + queue + "\"")))))
+                .subscriptionType(SubscriptionType.Shared)
+                .deadLetterProducer(dlq.producer)
+                .deadLetterObserver(events::add)
+                .build()
+                .poll();
+
+            assertEquals(1, dlq.sends(), queue);
+            assertEquals("orders", EnvelopeCodec.decode(dlq.lastRecord()).deadLetter().originalQueue(), queue);
+            assertEquals(1, events.size(), queue);
+            assertEquals(EnvelopeCodec.decode(json.replace("\"queue\":\"billing\"", "\"queue\":\"" + queue + "\""))
+                .meta().queue(), events.get(0).queue(), queue);
+        }
+    }
 }

@@ -269,7 +269,7 @@ public final class PulsarConsumer {
             leaveUnsettled(message, envelope, error);
             return;
         }
-        writeDeadLetterAndAcknowledge(message, envelope, record, properties, () -> originalQueue(message, envelope), reason);
+        writeDeadLetterAndAcknowledge(message, envelope, record, properties, () -> eventQueue(message, envelope), reason);
     }
 
     /**
@@ -461,6 +461,16 @@ public final class PulsarConsumer {
     private String originalQueue(Message<byte[]> message, Envelope envelope) {
         String queue = envelope.meta() == null ? null : envelope.meta().queue();
         return queue != null && !queue.isBlank() ? queue : queueName(message);
+    }
+
+    /**
+     * The source queue of a dead-letter <em>event</em> (ADR-0039 section 5.1): {@code meta.queue} unless it is empty or
+     * ASCII-blank (ADR-0031), else the consumed queue. Deliberately separate from {@link #originalQueue}: the DLQ
+     * record's {@code original_queue} is wire data and keeps its own rule.
+     */
+    private String eventQueue(Message<byte[]> message, Envelope envelope) {
+        String queue = envelope.meta() == null ? null : envelope.meta().queue();
+        return !EnvelopeCodec.isBlankAscii(queue) ? queue : queueName(message);
     }
 
     /** The short queue name of the consumed topic: tenant/namespace and a {@code -partition-N} suffix removed. */
