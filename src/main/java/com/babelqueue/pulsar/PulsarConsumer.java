@@ -1,6 +1,8 @@
 package com.babelqueue.pulsar;
 
 import com.babelqueue.BabelQueueException;
+import com.babelqueue.DeadLetterEvent;
+import com.babelqueue.DeadLetterObserver;
 import com.babelqueue.DeadLetters;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
@@ -77,6 +79,9 @@ import org.apache.pulsar.client.api.TypedMessageBuilder;
  * with a valid {@code job}/{@code urn} identity — is never handed to a handler. With a dead-letter producer it is
  * written to the DLQ at once, without retry, in the ADR-0035 shape ({@code reason: "poison"}, the original body
  * preserved), then acknowledged; without one it takes the bounded retry above and is finally dropped.
+ *
+ * <p>An optional {@link Builder#deadLetterObserver DeadLetterObserver} (ADR-0039 section 5.1) is called once per DLQ
+ * write the dead-letter producer confirmed; see its javadoc for what is and is not counted.
  */
 public final class PulsarConsumer {
 
@@ -121,6 +126,7 @@ public final class PulsarConsumer {
     private final RoutingMismatchHandler onRoutingMismatch;
     private final int maxAttempts;
     private final Producer<byte[]> deadLetterProducer;
+    private final DeadLetterObserver deadLetterObserver;
     private final Producer<byte[]> retryProducer;
     private final PulsarClient client;
     /** Retry producers this consumer created from {@code client}, by topic; closed by {@link #close()}. */
@@ -135,6 +141,7 @@ public final class PulsarConsumer {
         this.onRoutingMismatch = builder.onRoutingMismatch;
         this.maxAttempts = builder.maxAttempts;
         this.deadLetterProducer = builder.deadLetterProducer;
+        this.deadLetterObserver = builder.deadLetterObserver;
         this.retryProducer = builder.retryProducer;
         this.client = builder.client;
     }
@@ -262,7 +269,7 @@ public final class PulsarConsumer {
             leaveUnsettled(message, envelope, error);
             return;
         }
-        writeDeadLetterAndAcknowledge(message, envelope, record, properties);
+        writeDeadLetterAndAcknowledge(message, envelope, record, properties, () -> originalQueue(message, envelope), reason);
     }
 
     /**
@@ -288,7 +295,8 @@ public final class PulsarConsumer {
         }
         byte[] body = message.getValue() == null ? new byte[0] : message.getValue();
         Map<String, String> original = message.getProperties();
-        writeDeadLetterAndAcknowledge(message, null, body, original == null ? Map.of() : original);
+        writeDeadLetterAndAcknowledge(message, null, body, original == null ? Map.of() : original,
+            () -> queueName(message), "");
     }
 
     /**
@@ -318,20 +326,36 @@ public final class PulsarConsumer {
             return;
         }
         Map<String, String> original = message.getProperties();
-        writeDeadLetterAndAcknowledge(message, partial, record, original == null ? Map.of() : original);
+        writeDeadLetterAndAcknowledge(message, partial, record, original == null ? Map.of() : original,
+            () -> queueName(message), "poison");
     }
 
-    /** Sends {@code record} to the DLQ; the original is acknowledged only after the write succeeded. */
+    /**
+     * Sends {@code record} to the DLQ; the original is acknowledged only after the write succeeded. The
+     * {@link DeadLetterObserver} (ADR-0039 section 5.1) is told once, right after the confirmed write, with the source
+     * {@code queue} and the {@code reason} the record carries (empty for a raw version-gated body); a failed write
+     * never reaches it.
+     */
     private void writeDeadLetterAndAcknowledge(
-            Message<byte[]> message, Envelope envelope, byte[] record, Map<String, String> properties)
-            throws PulsarClientException {
+            Message<byte[]> message, Envelope envelope, byte[] record, Map<String, String> properties,
+            java.util.function.Supplier<String> queue, String reason) throws PulsarClientException {
         try {
             send(deadLetterProducer, record, properties);
         } catch (PulsarClientException | RuntimeException error) {
             leaveUnsettled(message, envelope, error);
             return;
         }
+        notifyDeadLetter(queue, reason);
         consumer.acknowledge(message);
+    }
+
+    /** Reports a DLQ write the producer just confirmed (ADR-0039 section 5.1); an observer failure never escapes. */
+    private void notifyDeadLetter(java.util.function.Supplier<String> queue, String reason) {
+        if (deadLetterObserver == null) {
+            return;
+        }
+        DeadLetterObserver.notifySafely(deadLetterObserver,
+            new DeadLetterEvent(queue.get(), deadLetterProducer.getTopic(), reason));
     }
 
     /**
@@ -557,6 +581,7 @@ public final class PulsarConsumer {
         private RoutingMismatchHandler onRoutingMismatch;
         private int maxAttempts = DEFAULT_MAX_ATTEMPTS;
         private Producer<byte[]> deadLetterProducer;
+        private DeadLetterObserver deadLetterObserver;
         private Producer<byte[]> retryProducer;
         private PulsarClient client;
         private SubscriptionType subscriptionType;
@@ -656,6 +681,17 @@ public final class PulsarConsumer {
          */
         public Builder subscriptionType(SubscriptionType subscriptionType) {
             this.subscriptionType = subscriptionType;
+            return this;
+        }
+
+        /**
+         * Optional observer called once per record written to the DLQ by the {@link #deadLetterProducer dead-letter
+         * producer}, after the write is confirmed (ADR-0039 section 5.1): an exhausted retry, an unknown URN, a poison
+         * body, a raw version-gated body. Not called when the write fails or when no dead-letter producer is set
+         * (the drop). A failure of the observer is logged and never changes the settle outcome.
+         */
+        public Builder deadLetterObserver(DeadLetterObserver deadLetterObserver) {
+            this.deadLetterObserver = deadLetterObserver;
             return this;
         }
 
