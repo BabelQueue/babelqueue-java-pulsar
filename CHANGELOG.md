@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-11-03
+
 ### Added
 
 - **Dead-letter observer (ADR-0039 section 5.1).** `PulsarConsumer.Builder#deadLetterObserver(DeadLetterObserver)` takes the core's optional `com.babelqueue.DeadLetterObserver` (needs a `babelqueue-core` that ships it). It is called once per record written to the DLQ by the dead-letter producer, right after the write succeeded: an exhausted retry (`failed`), an unmapped URN (`unknown_urn`), a poison body (`poison`) and a raw version-gated body (empty `reason`). `DeadLetterEvent.queue` is `meta.queue` for an exhausted envelope, else the topic name the message came from; `deadLetterQueue` is the dead-letter producer's topic. It is not called when the write fails, when no dead-letter producer is set (the drop), or while the retry cap is not reached; an observer failure is logged and never changes the settle outcome. Without an observer nothing changes.
