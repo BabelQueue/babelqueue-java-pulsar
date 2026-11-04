@@ -12,6 +12,8 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.babelqueue.BabelQueueException;
+import com.babelqueue.DeadLetterEvent;
+import com.babelqueue.DeadLetterObserver;
 import com.babelqueue.DeadLetters;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
@@ -681,6 +683,286 @@ class PulsarConsumerTest {
         } finally {
             // Clear the interrupted flag so it does not leak into other tests.
             Thread.interrupted();
+        }
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void deliveredTraceparentPropertyReachesTheHandlerViaHeadersOfAndNotTheBody() throws Exception {
+        String traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        Message<byte[]> message = message(0, envelopeJson(),
+            Map.of("bq-job", URN, "traceparent", traceparent));
+        Map<String, String>[] seen = new Map[]{null};
+
+        PulsarConsumer.builder(consumerWith(message)).subscriptionType(SubscriptionType.Shared)
+            .handler(URN, (e, m) -> seen[0] = BabelHandler.headersOf(m))
+            .build()
+            .poll();
+
+        assertEquals(traceparent, seen[0].get("traceparent"));
+        assertEquals(URN, seen[0].get("bq-job"));
+        assertTrue(!envelopeJson().contains("traceparent"));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void publisherOutputRoundTripsTraceparentToTheHandlerViaHeadersOf() throws Exception {
+        String traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        org.apache.pulsar.client.api.Producer<byte[]> producer = mock(org.apache.pulsar.client.api.Producer.class);
+        when(producer.getTopic()).thenReturn("orders");
+        org.apache.pulsar.client.api.TypedMessageBuilder<byte[]> builder =
+            mock(org.apache.pulsar.client.api.TypedMessageBuilder.class);
+        when(producer.newMessage()).thenReturn(builder);
+        when(builder.value(any())).thenReturn(builder);
+        when(builder.property(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.anyString()))
+            .thenReturn(builder);
+        when(builder.send()).thenReturn(mock(org.apache.pulsar.client.api.MessageId.class));
+        PulsarPublisher.create(producer).publish(URN, Map.of("order_id", 1), "trace-1", null,
+            Map.of("traceparent", traceparent));
+
+        org.mockito.ArgumentCaptor<byte[]> value = org.mockito.ArgumentCaptor.forClass(byte[].class);
+        org.mockito.Mockito.verify(builder).value(value.capture());
+        org.mockito.ArgumentCaptor<String> keys = org.mockito.ArgumentCaptor.forClass(String.class);
+        org.mockito.ArgumentCaptor<String> vals = org.mockito.ArgumentCaptor.forClass(String.class);
+        org.mockito.Mockito.verify(builder, org.mockito.Mockito.atLeastOnce()).property(keys.capture(), vals.capture());
+        Map<String, String> sentProperties = new java.util.HashMap<>();
+        for (int i = 0; i < keys.getAllValues().size(); i++) {
+            sentProperties.put(keys.getAllValues().get(i), vals.getAllValues().get(i));
+        }
+        String sentBody = new String(value.getValue(), StandardCharsets.UTF_8);
+        Map<String, String>[] seen = new Map[]{null};
+
+        // the broker hands the publisher's exact body and properties back
+        PulsarConsumer.builder(consumerWith(message(0, sentBody, sentProperties)))
+            .subscriptionType(SubscriptionType.Shared)
+            .handler(URN, (e, m) -> seen[0] = BabelHandler.headersOf(m))
+            .build()
+            .poll();
+
+        assertEquals(traceparent, seen[0].get("traceparent"));
+        assertTrue(!sentBody.contains("traceparent"));
+    }
+
+    // ---- ADR-0039 section 5.1 dead-letter observer ----------------------------------------------
+
+    private static final String DLQ_TOPIC = "persistent://public/default/orders.dlq";
+
+    private static DeadLetterProbe probe() throws Exception {
+        DeadLetterProbe dlq = new DeadLetterProbe();
+        when(dlq.producer.getTopic()).thenReturn(DLQ_TOPIC);
+        return dlq;
+    }
+
+    private static Message<byte[]> onTopic(Message<byte[]> message) {
+        when(message.getTopicName()).thenReturn("persistent://public/default/orders");
+        return message;
+    }
+
+    @Test
+    void observerSeesAnExhaustedRetryOnceWithQueueDlqAndReason() throws Exception {
+        DeadLetterProbe dlq = probe();
+        Message<byte[]> message = onTopic(message(2, envelopeJson())); // third delivery: exhausted
+        Consumer<byte[]> consumer = consumerWith(message);
+        java.util.List<DeadLetterEvent> events = new java.util.ArrayList<>();
+
+        PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared)
+            .handler(URN, (env, msg) -> { throw new IllegalStateException("boom"); })
+            .deadLetterProducer(dlq.producer)
+            .deadLetterObserver(events::add)
+            .build()
+            .poll();
+
+        assertEquals(java.util.List.of(new DeadLetterEvent("orders", DLQ_TOPIC, "failed")), events);
+        verify(consumer).acknowledge(message);
+    }
+
+    @Test
+    void observerSeesAnUnknownUrnDeadLetter() throws Exception {
+        DeadLetterProbe dlq = probe();
+        Message<byte[]> message = onTopic(message(2, envelopeJson()));
+        java.util.List<DeadLetterEvent> events = new java.util.ArrayList<>();
+
+        PulsarConsumer.builder(consumerWith(message)).subscriptionType(SubscriptionType.Shared)
+            .deadLetterProducer(dlq.producer)
+            .deadLetterObserver(events::add)
+            .build()
+            .poll();
+
+        assertEquals(java.util.List.of(new DeadLetterEvent("orders", DLQ_TOPIC, "unknown_urn")), events);
+    }
+
+    @Test
+    void observerSeesAPoisonRecord() throws Exception {
+        DeadLetterProbe dlq = probe();
+        Message<byte[]> message = onTopic(message(0, "not-json"));
+        java.util.List<DeadLetterEvent> events = new java.util.ArrayList<>();
+
+        PulsarConsumer.builder(consumerWith(message)).subscriptionType(SubscriptionType.Shared)
+            .deadLetterProducer(dlq.producer)
+            .deadLetterObserver(events::add)
+            .build()
+            .poll();
+
+        assertEquals(java.util.List.of(new DeadLetterEvent("orders", DLQ_TOPIC, "poison")), events);
+    }
+
+    @Test
+    void observerSeesAVersionGatedRawBodyWithAnEmptyReason() throws Exception {
+        DeadLetterProbe dlq = probe();
+        Message<byte[]> message = onTopic(message(0, "plain text, not JSON", Map.of("bq-schema-version", "2")));
+        java.util.List<DeadLetterEvent> events = new java.util.ArrayList<>();
+
+        PulsarConsumer.builder(consumerWith(message)).subscriptionType(SubscriptionType.Shared)
+            .deadLetterProducer(dlq.producer)
+            .deadLetterObserver(events::add)
+            .build()
+            .poll();
+
+        assertEquals(java.util.List.of(new DeadLetterEvent("orders", DLQ_TOPIC, "")), events);
+    }
+
+    @Test
+    void observerIsNotCalledWhenTheDlqWriteFails() throws Exception {
+        java.util.List<DeadLetterEvent> events = new java.util.ArrayList<>();
+        for (Message<byte[]> message : java.util.List.of(
+            onTopic(message(0, "plain", Map.of("bq-schema-version", "2"))),
+            onTopic(message(0, "not-json")),
+            onTopic(message(2, envelopeJson())))) {
+            DeadLetterProbe dlq = probe();
+            dlq.failWith(new org.apache.pulsar.client.api.PulsarClientException("broker down"));
+            Consumer<byte[]> consumer = consumerWith(message);
+
+            PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared)
+                .handler(URN, (env, msg) -> { throw new IllegalStateException("boom"); })
+                .deadLetterProducer(dlq.producer)
+                .deadLetterObserver(events::add)
+                .build()
+                .poll();
+
+            verify(consumer).negativeAcknowledge(message);
+        }
+
+        assertTrue(events.isEmpty());
+    }
+
+    @Test
+    void observerIsNotCalledWhenThereIsNoDeadLetterProducerOrTheRetryIsNotExhausted() throws Exception {
+        java.util.List<DeadLetterEvent> events = new java.util.ArrayList<>();
+        DeadLetterProbe dlq = probe();
+
+        PulsarConsumer.builder(consumerWith(message(2, envelopeJson()))).subscriptionType(SubscriptionType.Shared)
+            .handler(URN, (env, msg) -> { throw new IllegalStateException("boom"); })
+            .deadLetterObserver(events::add)
+            .build()
+            .poll();
+        PulsarConsumer.builder(consumerWith(message(0, envelopeJson()))).subscriptionType(SubscriptionType.Shared)
+            .handler(URN, (env, msg) -> { throw new IllegalStateException("boom"); })
+            .deadLetterProducer(dlq.producer)
+            .deadLetterObserver(events::add)
+            .build()
+            .poll();
+
+        assertTrue(events.isEmpty());
+        assertEquals(0, dlq.sends());
+    }
+
+    @Test
+    void aThrowingObserverDoesNotChangeTheSettleOutcome() throws Exception {
+        DeadLetterObserver boom = event -> { throw new IllegalStateException("observer down"); };
+        DeadLetterObserver fatal = event -> { throw new AssertionError("observer asserts"); };
+
+        for (DeadLetterObserver observer : java.util.List.of(boom, fatal)) {
+            for (Message<byte[]> message : java.util.List.of(
+                onTopic(message(2, envelopeJson())),
+                onTopic(message(0, "not-json")),
+                onTopic(message(0, "plain", Map.of("bq-schema-version", "2"))))) {
+                DeadLetterProbe dlq = probe();
+                Consumer<byte[]> consumer = consumerWith(message);
+
+                PulsarConsumer.builder(consumer).subscriptionType(SubscriptionType.Shared)
+                    .handler(URN, (env, msg) -> { throw new IllegalStateException("boom"); })
+                    .deadLetterProducer(dlq.producer)
+                    .deadLetterObserver(observer)
+                    .build()
+                    .poll();
+
+                assertEquals(1, dlq.sends());
+                verify(consumer).acknowledge(message);
+                verify(consumer, never()).negativeAcknowledge(any(Message.class));
+            }
+        }
+    }
+
+    @Test
+    void eventQueueIsMetaQueueForAnEnvelopeAndTheConsumedTopicForAPoisonRecord() throws Exception {
+        // meta.queue ("billing") differs from the topic the message was consumed from ("orders").
+        Envelope base = EnvelopeCodec.make(URN, Map.of("order_id", 1), "billing", null);
+        String billing = EnvelopeCodec.encode(base);
+        java.util.List<DeadLetterEvent> events = new java.util.ArrayList<>();
+
+        PulsarConsumer.builder(consumerWith(onTopic(message(2, billing)))).subscriptionType(SubscriptionType.Shared)
+            .handler(URN, (env, msg) -> { throw new IllegalStateException("boom"); })
+            .deadLetterProducer(probe().producer)
+            .deadLetterObserver(events::add)
+            .build()
+            .poll();
+        PulsarConsumer.builder(consumerWith(onTopic(message(0, "not-json")))).subscriptionType(SubscriptionType.Shared)
+            .deadLetterProducer(probe().producer)
+            .deadLetterObserver(events::add)
+            .build()
+            .poll();
+
+        assertEquals(java.util.List.of(
+            new DeadLetterEvent("billing", DLQ_TOPIC, "failed"),
+            new DeadLetterEvent("orders", DLQ_TOPIC, "poison")), events);
+    }
+
+    @Test
+    void eventQueueFallbackTreatsOnlyTheAsciiWhitespaceSetAsBlank() throws Exception {
+        String json = EnvelopeCodec.encode(EnvelopeCodec.make(URN, Map.of("order_id", 1), "billing", null));
+        // meta.queue as JSON text -> the queue the event must report. Only the ASCII whitespace set is blank (ADR-0031):
+        // Unicode spaces and control characters (Character.isWhitespace) are real, non-blank names.
+        String[][] cases = {
+            {" \\t", "orders"}, {"", "orders"}, {"\\u000b\\f\\r", "orders"},
+            {"\\u2003", "\u2003"}, {"\\u00a0", "\u00a0"}, {"\\u001c", "\u001c"}, {"\\u0085", "\u0085"},
+        };
+        for (String[] c : cases) {
+            java.util.List<DeadLetterEvent> events = new java.util.ArrayList<>();
+
+            PulsarConsumer.builder(consumerWith(onTopic(message(2, json.replace("\"queue\":\"billing\"", "\"queue\":\"" + c[0] + "\"")))))
+                .subscriptionType(SubscriptionType.Shared)
+                .deadLetterProducer(probe().producer)
+                .deadLetterObserver(events::add)
+                .build()
+                .poll();
+
+            assertEquals(1, events.size(), c[0]);
+            assertEquals(c[1], events.get(0).queue(), "meta.queue=" + c[0]);
+        }
+    }
+
+    @Test
+    void theDlqRecordOriginalQueueKeepsItsOwnBlankRuleWhileTheEventUsesTheAsciiSet() throws Exception {
+        // U+2003 and U+001C are Character.isWhitespace but not ADR-0031 blank: the event reports them as given, while the
+        // record's dead_letter.original_queue (wire data) is unchanged from before and still falls back to the topic.
+        String json = EnvelopeCodec.encode(EnvelopeCodec.make(URN, Map.of("order_id", 1), "billing", null));
+        for (String queue : new String[] {"\\u2003", "\\u001c"}) {
+            DeadLetterProbe dlq = probe();
+            java.util.List<DeadLetterEvent> events = new java.util.ArrayList<>();
+
+            PulsarConsumer.builder(consumerWith(onTopic(message(2,
+                    json.replace("\"queue\":\"billing\"", "\"queue\":\"" + queue + "\"")))))
+                .subscriptionType(SubscriptionType.Shared)
+                .deadLetterProducer(dlq.producer)
+                .deadLetterObserver(events::add)
+                .build()
+                .poll();
+
+            assertEquals(1, dlq.sends(), queue);
+            assertEquals("orders", EnvelopeCodec.decode(dlq.lastRecord()).deadLetter().originalQueue(), queue);
+            assertEquals(1, events.size(), queue);
+            assertEquals(EnvelopeCodec.decode(json.replace("\"queue\":\"billing\"", "\"queue\":\"" + queue + "\""))
+                .meta().queue(), events.get(0).queue(), queue);
         }
     }
 }

@@ -1,6 +1,7 @@
 package com.babelqueue.pulsar;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
@@ -22,5 +23,32 @@ class PulsarPropertiesTest {
         assertEquals(Integer.toString(env.meta().schemaVersion()), props.get("bq-schema-version"));
         assertEquals(env.meta().lang(), props.get("bq-source-lang"));
         assertEquals("0", props.get("bq-attempts"));
+    }
+
+    @Test
+    void outOfBandHeadersAreAddedBesideContractAndNeverClobberIt() {
+        Envelope env = EnvelopeCodec.make("urn:babel:orders:created", Map.of(), "orders", "trace-1");
+        Map<String, String> props = PulsarProperties.of(env);
+
+        PulsarProperties.addOutOfBand(props, Map.of(
+            "traceparent", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01", "bq-job", "urn:evil"));
+
+        assertEquals("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01", props.get("traceparent"));
+        assertEquals("urn:babel:orders:created", props.get("bq-job"));
+    }
+
+    @Test
+    void toMapSurfacesDeliveredPropertiesAndToleratesNone() {
+        @SuppressWarnings("unchecked")
+        org.apache.pulsar.client.api.Message<byte[]> message = org.mockito.Mockito.mock(
+            org.apache.pulsar.client.api.Message.class);
+        org.mockito.Mockito.when(message.getProperties()).thenReturn(Map.of("traceparent", "00-x", "blank", ""));
+
+        Map<String, String> map = PulsarProperties.toMap(message);
+
+        assertEquals("00-x", map.get("traceparent"));
+        assertTrue(!map.containsKey("blank"));
+        assertTrue(PulsarProperties.toMap(null).isEmpty());
+        assertTrue(BabelHandler.headersOf(null).isEmpty());
     }
 }

@@ -23,6 +23,10 @@ import org.apache.pulsar.client.api.TypedMessageBuilder;
  * String id = PulsarPublisher.create(producer)
  *     .publish("urn:babel:orders:created", Map.of("order_id", 1042));
  * }</pre>
+ *
+ * <p>Out-of-band transport headers (e.g. the W3C {@code traceparent}, ADR-0028) ride as extra message
+ * properties <b>beside</b> the contract {@code bq-} properties — never inside the envelope (GR-1); see
+ * {@link #publishWithHeaders(Envelope, Map)}, the seam for {@code com.babelqueue.otel.HeaderSender}.
  */
 public final class PulsarPublisher {
 
@@ -53,15 +57,45 @@ public final class PulsarPublisher {
      */
     public String publish(String urn, Map<String, Object> data, String traceId, Duration delay)
             throws PulsarClientException {
-        Envelope envelope = EnvelopeCodec.make(urn, data, topicName(), traceId);
+        return publish(urn, data, traceId, delay, null);
+    }
 
+    /**
+     * Publish as {@link #publish(String, Map, String, Duration)}, additionally carrying the
+     * out-of-band {@code headers} (e.g. {@code traceparent}) as message properties beside the contract
+     * {@code bq-} properties. A contract property already present always wins a collision; blank keys or
+     * values are skipped; {@code null}/empty {@code headers} is byte-identical to the plain overload.
+     */
+    public String publish(String urn, Map<String, Object> data, String traceId, Duration delay,
+                          Map<String, String> headers) throws PulsarClientException {
+        Envelope envelope = EnvelopeCodec.make(urn, data, topicName(), traceId);
+        return send(envelope, delay, headers);
+    }
+
+    /**
+     * Publish an already-built {@code envelope} together with out-of-band transport {@code headers}
+     * (e.g. a W3C {@code traceparent}, ADR-0028). This is the produce-side seam the optional
+     * {@code com.babelqueue.otel.HeaderSender} wires to. The message value stays the byte-identical
+     * envelope JSON. Returns {@code meta.id}.
+     */
+    public String publishWithHeaders(Envelope envelope, Map<String, String> headers) throws PulsarClientException {
+        return send(envelope, null, headers);
+    }
+
+    private String send(Envelope envelope, Duration delay, Map<String, String> headers)
+            throws PulsarClientException {
         TypedMessageBuilder<byte[]> message = producer.newMessage()
             .value(EnvelopeCodec.encode(envelope).getBytes(StandardCharsets.UTF_8));
-        for (Map.Entry<String, String> property : PulsarProperties.of(envelope).entrySet()) {
+        Map<String, String> properties = PulsarProperties.of(envelope);
+        boolean delayed = delay != null && !delay.isZero() && !delay.isNegative();
+        if (delayed) {
+            properties.put("bq-delay", Long.toString(delay.toMillis()));
+        }
+        PulsarProperties.addOutOfBand(properties, headers);
+        for (Map.Entry<String, String> property : properties.entrySet()) {
             message.property(property.getKey(), property.getValue());
         }
-        if (delay != null && !delay.isZero() && !delay.isNegative()) {
-            message.property("bq-delay", Long.toString(delay.toMillis()));
+        if (delayed) {
             message.deliverAfter(delay.toMillis(), TimeUnit.MILLISECONDS);
         }
 

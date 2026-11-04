@@ -1,6 +1,9 @@
 package com.babelqueue.pulsar;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -9,6 +12,9 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.babelqueue.Envelope;
+import com.babelqueue.EnvelopeCodec;
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -98,5 +104,106 @@ class PulsarPublisherTest {
             map.put(keys.get(i), values.get(i));
         }
         return map;
+    }
+
+    private static final String TRACEPARENT = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+    private static final String URN = "urn:babel:orders:created";
+
+    /** One captured send: the body bytes and the properties set on the message builder. */
+    private record Sent(byte[] value, Map<String, String> properties) {}
+
+    @SuppressWarnings("unchecked")
+    private static Sent publishWithHeaders(Envelope env, Map<String, String> headers) throws Exception {
+        Producer<byte[]> producer = mock(Producer.class);
+        when(producer.getTopic()).thenReturn("persistent://public/default/orders");
+        TypedMessageBuilder<byte[]> builder = mock(TypedMessageBuilder.class);
+        when(producer.newMessage()).thenReturn(builder);
+        when(builder.value(any())).thenReturn(builder);
+        when(builder.property(anyString(), anyString())).thenReturn(builder);
+        when(builder.send()).thenReturn(mock(MessageId.class));
+
+        PulsarPublisher.create(producer).publishWithHeaders(env, headers);
+
+        ArgumentCaptor<byte[]> value = ArgumentCaptor.forClass(byte[].class);
+        verify(builder).value(value.capture());
+        ArgumentCaptor<String> keys = ArgumentCaptor.forClass(String.class);
+        ArgumentCaptor<String> vals = ArgumentCaptor.forClass(String.class);
+        verify(builder, atLeastOnce()).property(keys.capture(), vals.capture());
+        return new Sent(value.getValue(), zip(keys.getAllValues(), vals.getAllValues()));
+    }
+
+    @Test
+    void publishWithHeadersCarriesTraceparentBesideContractPropertiesAndNotInTheBody() throws Exception {
+        Envelope env = EnvelopeCodec.make(URN, Map.of("order_id", 7), "orders", "trace-1");
+
+        Sent sent = publishWithHeaders(env, Map.of("traceparent", TRACEPARENT, "tracestate", "vendor=1"));
+
+        assertEquals(TRACEPARENT, sent.properties().get("traceparent"));
+        assertEquals("vendor=1", sent.properties().get("tracestate"));
+        assertEquals(URN, sent.properties().get("bq-job"));
+        assertEquals("trace-1", sent.properties().get("bq-trace-id"));
+        assertFalse(new String(sent.value(), StandardCharsets.UTF_8).contains("traceparent"));
+        assertFalse(new String(sent.value(), StandardCharsets.UTF_8).contains(TRACEPARENT));
+    }
+
+    @Test
+    void bodyIsByteIdenticalWithAndWithoutHeaders() throws Exception {
+        Envelope env = EnvelopeCodec.make(URN, Map.of("order_id", 7), "orders", "trace-1");
+
+        Sent with = publishWithHeaders(env, Map.of("traceparent", TRACEPARENT));
+        Sent plain = publishWithHeaders(env, null);
+
+        assertArrayEquals(plain.value(), with.value());
+        assertEquals(PulsarProperties.of(env), plain.properties());
+    }
+
+    @Test
+    void contractPropertyWinsACollisionAndBlanksAreSkipped() throws Exception {
+        Envelope env = EnvelopeCodec.make(URN, Map.of(), "orders", "trace-1");
+
+        Sent sent = publishWithHeaders(env, Map.of("bq-job", "urn:evil", "traceparent", "", "x-empty", ""));
+
+        assertEquals(URN, sent.properties().get("bq-job"));
+        assertFalse(sent.properties().containsKey("traceparent"));
+        assertFalse(sent.properties().containsKey("x-empty"));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void publishOverloadWithHeadersRidesTheDelayedMessageToo() throws Exception {
+        Producer<byte[]> producer = mock(Producer.class);
+        when(producer.getTopic()).thenReturn("orders");
+        TypedMessageBuilder<byte[]> builder = mock(TypedMessageBuilder.class);
+        when(producer.newMessage()).thenReturn(builder);
+        when(builder.value(any())).thenReturn(builder);
+        when(builder.property(anyString(), anyString())).thenReturn(builder);
+        when(builder.deliverAfter(anyLong(), any())).thenReturn(builder);
+        when(builder.send()).thenReturn(mock(MessageId.class));
+
+        PulsarPublisher.create(producer)
+            .publish(URN, Map.of(), null, java.time.Duration.ofSeconds(30), Map.of("traceparent", TRACEPARENT));
+
+        verify(builder).property("traceparent", TRACEPARENT);
+        verify(builder).property("bq-delay", "30000");
+        verify(builder).deliverAfter(30000L, java.util.concurrent.TimeUnit.MILLISECONDS);
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void publishWithHeadersMatchesTheOtelHeaderSenderContract() throws Exception {
+        Producer<byte[]> producer = mock(Producer.class);
+        when(producer.getTopic()).thenReturn("orders");
+        TypedMessageBuilder<byte[]> builder = mock(TypedMessageBuilder.class);
+        when(producer.newMessage()).thenReturn(builder);
+        when(builder.value(any())).thenReturn(builder);
+        when(builder.property(anyString(), anyString())).thenReturn(builder);
+        when(builder.send()).thenReturn(mock(MessageId.class));
+        PulsarPublisher publisher = PulsarPublisher.create(producer);
+        com.babelqueue.otel.HeaderSender sender = publisher::publishWithHeaders;
+
+        assertDoesNotThrow(() -> sender.send(EnvelopeCodec.make(URN, Map.of(), "orders", "t"),
+            Map.of("traceparent", TRACEPARENT)));
+
+        verify(builder).property("traceparent", TRACEPARENT);
     }
 }
